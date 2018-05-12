@@ -1,0 +1,2400 @@
+---
+title: "STAT5003 - Predicting Novel Kinase Substrates"
+author: "<h2>Authors:</h2></br>Beulah Shantini</br>Damian Steele</br>Dennis Yuan</br>Emil Laurence Pastor</br>Ye Fan"
+date: "31 October 2017"
+output:
+  html_document:
+    code_folding: show
+---
+# 1. Data Initialisation and Retrieval
+
+## Load R Libraries
+```{r libraries, warning=FALSE, message=FALSE}
+library(RPostgreSQL)
+library(Biostrings)
+library(doParallel)
+library(foreach)
+library(protr)
+library(caret)
+library(e1071)
+library(ggseqlogo)
+library(xgboost)
+library(randomForest)
+library(knitr)
+library(pROC)
+library(ClueR)
+library(PRROC)
+library(precrec)
+library(MASS)
+library(plot3D)
+library(plotly)
+library(RColorBrewer)
+```
+
+
+```{r load_ppdata, fig.align="center", echo=FALSE}
+
+load("PreProcessedData.RData")
+
+```
+
+## Connect to AWS Postgres Instance
+
+Source data was loaded into a Postgre database to assist analysis. The objective here was to persist any generated datasets.
+
+```{r setup_db, warning=FALSE, message=FALSE}
+pg = dbDriver("PostgreSQL")
+
+pool <- dbConnect(
+  pg,
+  dbname = "STAT5003_G13",
+  host = "stat5003g13.cbe5hq61ynmb.ap-southeast-2.rds.amazonaws.com",
+  user = "STAT5003_G13",
+  password = "STAT5003_G13"
+)
+```
+
+## Read the cleansed data
+
+The data was initial prepared, and loaded into the database to ensure consistant data types.
+
+```{r data_retrieval read_data, echo=TRUE, eval=FALSE}
+# Select all data from POSTGRES DB
+all.data <- dbGetQuery(pool,"SELECT
+ identifier
+,seq_window
+,avg_fold
+,auc
+,time_15s
+,time_30s
+,time_1m
+,time_2m
+,time_5m
+,time_10m
+,time_20m
+,time_60m
+,ins_1
+,ly
+,ins_2
+,mk
+FROM Cleansed_InsulinPhospho
+ORDER BY COALESCE(akt_flag,0) DESC, COALESCE(mtor_flag,0) DESC, identifier;")
+
+# Assign row names in the data
+rownames(all.data) <- all.data[,1]
+all.data <- all.data[,-1]
+
+# Get akt substrates from AWS
+akt <- dbGetQuery(pool, "SELECT * FROM stg_akt_substrates ORDER BY identifier;")
+rownames(akt) <- akt[,1]
+akt.length <- nrow(akt)
+
+# Get mtor substrates from AWS
+mtor <- dbGetQuery(pool, "SELECT * FROM stg_mtor_substrates ORDER BY identifier;")
+rownames(mtor) <- mtor[,1]
+mtor.length <- nrow(mtor)
+
+# Combine the total number of known akt and mtor substrates
+substrate.length <- akt.length + mtor.length
+
+# Store data dimension
+all.data.nrow <- dim(all.data)[1]
+all.data.ncol <- dim(all.data)[2]
+
+# Get the protein sequence data
+all.seq.data <- data.frame(all.data [,1])
+rownames(all.seq.data) <- rownames(all.data)
+
+# Extract individual substrate data
+akt.substrate.seq.data <- as.character(all.seq.data[rownames(akt),])
+mtor.substrate.seq.data <- as.character(all.seq.data[rownames(mtor),])
+
+```
+
+# 2. Data Exploration
+
+## Visualise Known Akt and mTOR substrates data
+
+/*
+ - Boxplots
+ - Akt, mTOR visually distinct based on AUC and log2 time profile
+*/
+
+Visual inspection of the source data was achieved using boxplots, and stacked plot. The objective was to explore patterns in both the control, insulin treated, and inhibited samples. Both the log2 fold change, and AUC visualisations suggest profile characterics.
+
+```{r data_explore, fig.align="center", warning=FALSE ,echo=TRUE}
+
+# Create akt data
+akt.data <- all.data[rownames(akt),-1]
+
+# Create mTOR data
+mtor.data <- all.data[rownames(mtor),-1]
+
+# Generate boxplots for Akt time points
+label = c("15s", "30s","1m","2m","5m","10m","20m","60m")
+boxplot(akt.data$time_15s, akt.data$time_30s, akt.data$time_1m, akt.data$time_2m, akt.data$time_5m, akt.data$time_10m, akt.data$time_20m, akt.data$time_60m, ylab="log2 FC", xlab="Time Point", main="Akt", names=label, col="dodgerblue1")
+
+# Generate boxplots for mTOR time points
+boxplot(mtor.data$time_15s, mtor.data$time_30s, mtor.data$time_1m, mtor.data$time_2m, mtor.data$time_5m, mtor.data$time_10m, mtor.data$time_20m, mtor.data$time_60m, ylab="log2 FC", xlab="Time Point", main="mTOR", names=label, col="lightsalmon1")
+
+# Generate boxplots for Akt insulin stimulated phosphorylation level
+label = c("Ins/Basal(rep1)","(LY+Ins)/Basal","Ins/Basal(rep2)","(MK+Ins)/Basal")
+boxplot(akt.data$ins_1, akt.data$ly, akt.data$ins_2, akt.data$mk, ylab="log2 FC", main="Akt", col="dodgerblue1")
+
+text(x =  seq_along(label), y = par("usr")[3] - 0.3, srt = 45, adj = 1,
+     labels = label, xpd = TRUE)
+
+# Generate boxplots for mTOR insulin stimulated phosphorylation level
+boxplot(mtor.data$ins_1, mtor.data$ly, mtor.data$ins_2, mtor.data$mk, ylab="log2 FC", main="mTOR", col="lightsalmon1")
+
+text(x =  seq_along(label), y = par("usr")[3] - 0.4, srt = 45, adj = 1,
+     labels = label, xpd = TRUE)
+
+# Generate substrate distribution area
+akt.density <- density(akt.data$auc)
+mtor.density <- density(mtor.data$auc)
+all.density <- density(all.data$auc)
+dodgerblue <- rgb(0/255,135/255,255/255,0.2)
+lightsalmon <- rgb(255/255,160/255,122/255,0.3)
+seagreen <- rgb(32/255,178/255,170/255,0.3)
+
+plot(akt.density, type="l", col = rgb(0/255,135/255,255/255,0.2), xlab="Area under the curve", ylab="Density", xlim=c(0,1), ylim=c(0,6), main="AUC Density Distribution")
+polygon(x = akt.density$x,y=akt.density$y,col=dodgerblue, border=dodgerblue)
+polygon(x = mtor.density$x,y=mtor.density$y,col=lightsalmon, border=lightsalmon)
+polygon(x = all.density$x,y=all.density$y,col=seagreen, border=seagreen)
+legend("topleft", legend=c("Akt", "mTOR", "All"), fill=c(dodgerblue, lightsalmon, seagreen),density=c(NA, NA, NA), bty="n",border=c("black", "black", "black")) 
+
+```
+
+# 3. Feature Engineering
+
+## PSSM Motif Scoring for Akt
+
+- PSSM using sequence position, and using character set and position
+
+The sequence window was first investigated for feature extraction potential. As a first step, the Position Weighted Matrix (PSSM) technique was employed. This technique calculates the frequency of each kinase substrate sequence (motif)
+
+```{r pssm_akt, fig.align="center", warning=FALSE ,echo=TRUE, eval=FALSE}
+
+# Generate consensus matrix for akt substrates
+akt.pssm <- consensusMatrix(akt.substrate.seq.data, as.prob = TRUE)
+
+# Split sequence window into individual characters
+akt.seq.split <- t(data.frame(strsplit(as.character(all.seq.data[,1]), "")))
+
+# Get the number of columns
+akt.seq.colnum <- dim(akt.seq.split)[2]
+
+# Assign row names in the data
+rownames(akt.seq.split) <- rownames(all.data)
+
+# Build empty pssm matrix
+akt.seq.pssm.score <- data.frame(rownames(all.data))
+rownames(akt.seq.pssm.score) <- rownames(all.data)
+akt.seq.pssm.score <- akt.seq.pssm.score[,-1]
+
+# Extract the character value from the consensus matrix
+for(i in 1:akt.seq.colnum){
+    temp <- match(akt.seq.split[,i],row.names(akt.pssm))
+    
+    akt.seq.pssm.score <- cbind(akt.seq.pssm.score, akt.pssm[temp,i])
+    
+    colnames(akt.seq.pssm.score)[i] <- paste("V", i,sep = "")
+}
+
+# Assign 0 for values with NA
+akt.seq.pssm.score[is.na(akt.seq.pssm.score)] <- 0
+
+# Generate the row sum of the individual consensus matrix character score
+akt.seq.pssm.score <- cbind(akt.seq.pssm.score, rowSums(akt.seq.pssm.score))
+colnames(akt.seq.pssm.score)[akt.seq.colnum + 1] <- "motif.score"
+
+```
+
+## Plot Akt Position Weight Matrix Sequence Logo
+
+The output of the PSSM is best visualised.
+
+```{r pssm_akt_logo, fig.align="center", echo=TRUE}
+
+ggseqlogo(akt.pssm)
+print(akt.pssm)
+
+```
+
+## PSSM Motif Scoring for mTOR
+
+- PSSM produced for mTOR motif
+
+A PSSM for mTOR kinases was also developed.
+
+```{r pssm_mtor, fig.align="center", warning=FALSE ,echo=TRUE, eval=FALSE}
+
+# Generate consensus matrix for mtor substrates
+mtor.pssm <- consensusMatrix(mtor.substrate.seq.data, as.prob = TRUE)
+
+# Split sequence window into individual characters
+mtor.seq.split <- t(data.frame(strsplit(as.character(all.seq.data[,1]), "")))
+
+# Get the number of columns
+mtor.seq.colnum <- dim(mtor.seq.split)[2]
+
+# Assign row names in the data
+rownames(mtor.seq.split) <- rownames(all.data)
+
+# Build empty pssm matrix
+mtor.seq.pssm.score <- data.frame(rownames(all.data))
+rownames(mtor.seq.pssm.score) <- rownames(all.data)
+mtor.seq.pssm.score <- mtor.seq.pssm.score[,-1]
+
+# Extract the character value from the consensus matrix
+for(i in 1:mtor.seq.colnum){
+    temp <- match(mtor.seq.split[,i],row.names(mtor.pssm))
+    
+    mtor.seq.pssm.score <- cbind(mtor.seq.pssm.score, mtor.pssm[temp,i])
+    
+    colnames(mtor.seq.pssm.score)[i] <- paste("V", i,sep = "")
+}
+
+# Assign 0 for values with NA
+mtor.seq.pssm.score[is.na(mtor.seq.pssm.score)] <- 0
+
+# Generate the row sum of the individual consensus matrix character score
+mtor.seq.pssm.score <- cbind(mtor.seq.pssm.score, rowSums(mtor.seq.pssm.score))
+colnames(mtor.seq.pssm.score)[mtor.seq.colnum + 1] <- "motif.score"
+
+```
+
+## Plot mTOR Position Weight Matrix Sequence Logo
+
+- Visually confirm the PSSM
+
+Again, the output of the mTOR PSSM is best visualised.
+
+```{r pssm_mtor_logo, fig.align="center", echo=TRUE}
+
+ggseqlogo(mtor.pssm)
+print(akt.pssm)
+
+
+```
+
+## Generate Sparse Sequence Window Matrix for Akt
+
+- Spare sequence
+
+Alternative methods for sequence profiling were also investigated. One such method was developing a sparse sequence matrix, although introduced performance and scalability issues and not used.
+
+```{r sparse_akt, echo=TRUE, eval=FALSE}
+
+# Split sequence window into individual characters
+akt.seq.split <- t(data.frame(strsplit(as.character(all.seq.data[,1]), "")))
+akt.seq.colnum <- dim(akt.seq.split)[2]
+rownames(akt.seq.split) <- rownames(all.data)
+
+# Get the unique character within the akt substrates
+akt.substrate.seq.unique <- sort(unique(unlist(strsplit(paste(akt.substrate.seq.data,collapse=''),""))))
+
+# Get the number of possible unique character in an akt substrate
+ncharacter <- length(akt.substrate.seq.unique)
+
+# Build the zero matrix
+akt.seq.sparse.data <- matrix(0, ncol = 13 * ncharacter, nrow = all.data.nrow)
+rownames(akt.seq.sparse.data) <- rownames(all.data)
+
+# Update the value of the matrix depending on the letter and position in the sequence to 1
+for(i in 1:akt.seq.colnum){
+    temp <- match(akt.seq.split[,i],akt.substrate.seq.unique) + ((i - 1) * ncharacter)
+    
+    mat.idx <- cbind(1:all.data.nrow, temp)
+    rownames(mat.idx) <- rownames(all.data)
+    
+    mat.na <- na.omit(mat.idx)
+    
+    mat.idx <- mat.idx[mat.na[,1],]
+    
+    akt.seq.sparse.data[mat.idx] <- 1
+}
+
+# Convert into data frame
+akt.seq.sparse.data <- data.frame(akt.seq.sparse.data)
+
+# Assign column names
+idx <- seq(1, 13 * ncharacter, ncharacter)
+
+for(i in 1:13){
+    colnames(akt.seq.sparse.data)[idx[i]:(idx[i] + ncharacter - 1)] <- paste(akt.substrate.seq.unique, i, sep="")
+}
+```
+
+## Generate Sparse Sequence Window Matrix for mTOR
+
+Alternatives techniques were evaluated to mTOR and Akt, but not adopted.
+
+```{r sparse_mtor, echo=TRUE, eval=FALSE}
+
+# Split sequence window into individual characters
+mtor.seq.split <- t(data.frame(strsplit(as.character(all.seq.data[,1]), "")))
+mtor.seq.colnum <- dim(mtor.seq.split)[2]
+rownames(mtor.seq.split) <- rownames(all.data)
+
+# Get the unique character within the mtor substrates
+mtor.substrate.seq.unique <- sort(unique(unlist(strsplit(paste(mtor.substrate.seq.data,collapse=''),""))))
+
+# Get the number of possible unique character in a mtor substrate
+ncharacter <- length(mtor.substrate.seq.unique)
+
+# Build the zero matrix
+mtor.seq.sparse.data <- matrix(0, ncol = 13 * ncharacter, nrow = all.data.nrow)
+rownames(mtor.seq.sparse.data) <- rownames(all.data)
+
+# Update the value of the matrix depending on the letter and position in the sequence to 1
+for(i in 1:mtor.seq.colnum){
+    temp <- match(mtor.seq.split[,i],mtor.substrate.seq.unique) + ((i - 1) * ncharacter)
+    
+    mat.idx <- cbind(1:all.data.nrow, temp)
+    rownames(mat.idx) <- rownames(all.data)
+    
+    #mat.na <- which(is.na(mat.idx), arr.ind = TRUE)
+    mat.na <- na.omit(mat.idx)
+    
+    mat.idx <- mat.idx[mat.na[,1],]
+    
+    mtor.seq.sparse.data[mat.idx] <- 1
+}
+
+# Convert into data frame
+mtor.seq.sparse.data <- data.frame(mtor.seq.sparse.data)
+
+# Assign column names
+idx <- seq(1, 13 * ncharacter, ncharacter)
+
+for(i in 1:13){
+    colnames(mtor.seq.sparse.data)[idx[i]:(idx[i] + ncharacter - 1)] <- paste(mtor.substrate.seq.unique, i, sep="")
+}
+
+```
+
+## PROTR sequence similarity using Global Alignment BLOSUM62
+
+- Pair-wise similarity to score sequences
+
+Using pair-wise simularity scores, we attempt to identify possible relationships between known and unlabelled substrates using motifs.
+
+```{r protr_seqsim, echo=TRUE, eval=FALSE}
+# Number of unknown sequence to process per iteration
+k <- 100
+
+# Generate index sequence
+n <- seq(substrate.length + 1, all.data.nrow,by = k)
+
+# Initialise the temporary row indexes
+i <- 1
+ti <- n[i]
+tf <- (n[i] + k - 1)
+
+# Initialise known substrate similarity score
+all.parSeqSim.score <- parSeqSim(all.seq.data[1:substrate.length,1], type="global", cores = 4)
+diag(all.parSeqSim.score) <- -1
+
+# Iterate up to length(n) times to get the similarity of known against unknown substrates
+for(i in 1:length(n)){
+    start <- Sys.time()
+    
+    if (i == length(n)) {
+        ri <- n[i]
+        rf <- dim(all.seq.data)[1]
+        tf <- ti + rf - ri
+    } else {
+        ri <- n[i]
+        rf <- (n[i] + k - 1)
+    }
+    
+    temp <- c(as.character(all.seq.data[1:substrate.length,1]), as.character(all.seq.data[ri:rf,1]))
+    
+    all.parSeqSim.temp <- parSeqSim(temp, type="global", cores = 4)
+    
+    all.parSeqSim.score <- rbind(all.parSeqSim.score, all.parSeqSim.temp[ti:tf,1:substrate.length])
+
+    closeAllConnections()
+}
+
+all.parSeqSim.score <- data.frame(all.parSeqSim.score)
+rownames(all.parSeqSim.score) <- rownames(all.data)
+
+# Column names
+for(j in 1:substrate.length){
+    
+    if (j <= akt.length){
+    
+    colnames(all.parSeqSim.score)[j] <- paste("A", j, sep="")
+    } else {
+    
+    k <- j - akt.length
+    colnames(all.parSeqSim.score)[j] <- paste("M", k, sep="")
+    }
+}
+
+# Pairwise sequence similarity score per substrate
+akt.parSeqSim.score <- data.frame(rowMax(all.parSeqSim.score[,1:akt.length]))
+colnames(akt.parSeqSim.score) <- 'akt.parSeqSim.score'
+mtor.parSeqSim.score <- data.frame(rowMax(all.parSeqSim.score[,(akt.length + 1):substrate.length]))
+colnames(mtor.parSeqSim.score) <- 'mtor.parSeqSim.score'
+
+# Finalise data set
+all.parSeqSim.score <- cbind(all.parSeqSim.score, akt.parSeqSim.score,mtor.parSeqSim.score)
+
+```
+
+# 3. Build Classifier
+
+## Support Vector Machine
+
+The first technique evaluated was Support Vector Machine. Due to the inbalanced nature of substrates of interest, a sampling technique was devised.
+
+- All known 'positive' substrates are used, and balanced with alternative i.e. mTOR vs. Akt kinases as 'negative' set
+- Training data is balanced using a 'simple' downsampling technique
+
+Based on a process of trial-and-error; attempts to improve individual model performance were explored.
+
+- cross-validation is used to address dataset bias and correction applied to improve predictions based on the fact 'positive' substrates are yet to be identifed, so therefore boosting the predict prob. for the model
+
+To further enhance model performance, an ensembling approach was developed. The details and findings of these approaches are later discussed.  
+
+```{r classif_svm, echo=TRUE}
+
+svmEnsemble <- function(full.data, stack.size, positive.substrate, negative.substrate, negative.size, fold.n, negative.substrate.flag, seedn, validation.flag, validation.substrate, seed.flag) {
+  
+    # Configure Data
+    positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+    
+    unlabelled.data <- subset(full.data, !rownames(full.data) %in% rownames(positive.substrate))
+    
+    if(validation.flag==1){
+        positive.data <- subset(positive.data, !rownames(positive.data) %in% rownames(validation.substrate))
+        unlabelled.data <- subset(unlabelled.data, !rownames(unlabelled.data) %in% rownames(validation.substrate))
+    }
+    
+    # Initialise Parameters
+    stack.models <- list()
+    c.parameters <- c()
+    TP.parameters <- c()
+    TN.parameters <- c()
+    FP.parameters <- c()
+    FN.parameters <- c()
+    full.predict <- c()
+    validation.predict <- c()
+    corrected.predict <- 0
+    
+    other.data <- unlabelled.data
+    
+    for (i in 1:stack.size){
+    
+    if (seed.flag == TRUE){
+      set.seed(i)
+    }
+    #print(i)
+    # Sample Data
+    if (negative.substrate.flag == 1 && i == 1){
+        
+        if (nrow(positive.substrate) > nrow(negative.substrate)){
+        
+        #positive.data.rowname <- rownames(positive.substrate)[sample(1:nrow(positive.substrate), size = negative.size, replace = FALSE)]
+        #positive.data <- subset(positive.data, rownames(positive.data) %in% positive.data.rowname)
+        
+        n <- nrow(negative.substrate)
+        
+        } else{
+        
+        n <- negative.size
+        }
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.substrate)[sample(1:nrow(negative.substrate), size = n, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else if (negative.substrate.flag == 1){
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data <- subset(negative.data, !rownames(negative.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else {
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    }
+    
+    
+    # Assign class data
+    Class <- as.factor(rep(c("positive", "negative"), times=c(nrow(positive.data), nrow(negative.data))))
+    
+    # Combine data rows
+    subset.data <- rbind(positive.data, negative.data)
+    
+    # Combine subset data and class columns
+    subset.data <- cbind(subset.data, Class)
+    
+    # Create folds based on fold.n values
+    fold <- createFolds(Class, fold.n);
+    
+    # Create train and test data
+    training.data <- subset.data[-fold$Fold1,]
+    testing.data <- subset.data[fold$Fold1,]
+    
+    # Set control parameters for training
+    stack.model <- svm(Class~., data=training.data, kernel='radial', probability=TRUE)
+    
+    # Validate test data
+    testing.data.rowname <- rownames(testing.data)[which(testing.data$Class == 'positive')]
+    testing.data.noclass <- subset(testing.data, rownames(testing.data) %in% testing.data.rowname, select = colnames(testing.data)[-dim(testing.data)[2]])
+    
+    testing.data.all <- subset(testing.data, select = colnames(testing.data)[-dim(testing.data)[2]])
+    
+    test.positive.predict <- attr(predict(stack.model, newdata=testing.data.noclass, probability=TRUE),"probabilities")[which(testing.data$Class == 'positive')]
+    
+    test.predict <- as.factor(predict(stack.model, newdata=testing.data.all))
+    
+    TP.parameters <- c(TP.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 'positive']))
+    TN.parameters <- c(TN.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 'negative']))
+    FP.parameters <- c(FP.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 'negative']))
+    FN.parameters <- c(FN.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 'positive']))
+    
+    c.temp <- sum(test.positive.predict)/length(test.positive.predict)
+        
+    c.parameters <- c(c.parameters, c.temp)
+    
+    # Train all the subset data
+    stack.model <- svm(Class~., data=subset.data, kernel='radial', probability=TRUE)
+    
+    stack.models[[i]] <- stack.model
+    
+    full.data.predict <- attr(predict(stack.model, newdata=full.data, probability=TRUE),"probabilities")[,1]
+    
+    full.predict <- cbind(full.predict, full.data.predict)
+    
+    ensemble.predict <- data.frame(attr(predict(stack.models[[i]], full.data, decision.values=TRUE, probability=TRUE),"probabilities")[,1]);
+    corrected.predict <- corrected.predict + ensemble.predict/ c.parameters[i]
+    }
+    
+    corr.predict <- (corrected.predict / stack.size)
+    corrected.predict <- corr.predict / max(corr.predict)
+    rownames(corrected.predict) <- rownames(full.data)
+    colnames(corrected.predict) <- 'corrected.predict'
+    
+    average.predict <- data.frame(rowMeans(full.predict))
+    colnames(average.predict) <- 'average.predict'
+    
+    model.result <- list()
+    model.result$c <- c.parameters
+    model.result$TP <- TP.parameters
+    model.result$TN <- TN.parameters
+    model.result$FP <- FP.parameters
+    model.result$FN <- FN.parameters
+    model.result$model <- stack.models
+    model.result$avgpredict <- average.predict
+    model.result$correctedpredict <- corrected.predict
+    
+    return(model.result)
+}
+
+```
+
+## Logistic Regression
+
+Alternative methods for classification were also examined; one such method was logistic regression. As described above, sampling and correction techniques were also applied.
+
+```{r classif_lr, echo=TRUE}
+
+logisticRegressionEnsemble <- function(full.data, stack.size, positive.substrate, negative.substrate, negative.size, fold.n, negative.substrate.flag, seedn, validation.flag, validation.substrate, seed.flag) {
+  
+    # Configure Data
+    positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+    
+    unlabelled.data <- subset(full.data, !rownames(full.data) %in% rownames(positive.substrate))
+    
+    if(validation.flag==1){
+        positive.data <- subset(positive.data, !rownames(positive.data) %in% rownames(validation.substrate))
+        unlabelled.data <- subset(unlabelled.data, !rownames(unlabelled.data) %in% rownames(validation.substrate))
+    }
+    
+    # Initialise Parameters
+    stack.models <- list()
+    c.parameters <- c()
+    TP.parameters <- c()
+    TN.parameters <- c()
+    FP.parameters <- c()
+    FN.parameters <- c()
+    full.predict <- c()
+    validation.predict <- c()
+    corrected.predict <- 0
+    
+    other.data <- unlabelled.data
+    
+    for (i in 1:stack.size){
+    
+    if (seed.flag == TRUE){
+      set.seed(i)
+    }
+      
+    #print(i)
+    # Sample Data
+    if (negative.substrate.flag == 1 && i == 1){
+        
+        if (nrow(positive.substrate) > nrow(negative.substrate)){
+        
+        #positive.data.rowname <- rownames(positive.substrate)[sample(1:nrow(positive.substrate), size = negative.size, replace = FALSE)]
+        #positive.data <- subset(positive.data, rownames(positive.data) %in% positive.data.rowname)
+        
+        n <- nrow(negative.substrate)
+        
+        } else{
+        
+        n <- negative.size
+        }
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.substrate)[sample(1:nrow(negative.substrate), size = n, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else if (negative.substrate.flag == 1){
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data <- subset(negative.data, !rownames(negative.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else {
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    }
+    
+    # Assign class data
+    Class <- as.factor(rep(c("positive", "negative"), times=c(nrow(positive.data), nrow(negative.data))))
+    
+    # Combine data rows
+    subset.data <- rbind(positive.data, negative.data)
+    
+    # Combine subset data and class columns
+    subset.data <- cbind(subset.data, Class)
+    
+    # Create folds based on fold.n values
+    fold <- createFolds(Class, fold.n);
+    
+    # Create train and test data
+    training.data <- subset.data[-fold$Fold1,]
+    testing.data <- subset.data[fold$Fold1,]
+    
+    # Train Control
+    fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           ## repeated ten times
+                           repeats = 1)
+                           
+    # Set control parameters for training
+    stack.model <- train(Class~., data=training.data, method='glmnet', trControl = fitControl)
+    
+    # Validate test data
+    testing.data.rowname <- rownames(testing.data)[which(testing.data$Class == 'positive')]
+    testing.data.noclass <- subset(testing.data, rownames(testing.data) %in% testing.data.rowname, select = colnames(testing.data)[-dim(testing.data)[2]])
+    
+    testing.data.all <- subset(testing.data, select = colnames(testing.data)[-dim(testing.data)[2]])
+    
+    test.positive.predict <- predict(stack.model, newdata=testing.data.noclass, type="prob")[,2]
+    
+    test.predict <- as.factor(ifelse(predict(stack.model, newdata=testing.data.all, type="prob")[,2]>0.5,'positive','negative'))
+    
+    TP.parameters <- c(TP.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 'positive']))
+    TN.parameters <- c(TN.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 'negative']))
+    FP.parameters <- c(FP.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 'negative']))
+    FN.parameters <- c(FN.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 'positive']))
+    
+    c.temp <- sum(test.positive.predict)/length(test.positive.predict)
+        
+    c.parameters <- c(c.parameters, c.temp)
+    
+    # Train all the subset data
+    stack.model <- train(Class~., data=subset.data, method='glmnet', trControl = fitControl)
+    
+    stack.models[[i]] <- stack.model
+    
+    full.data.predict <- predict(stack.model, newdata=full.data, type="prob")[,2]
+    full.predict <- cbind(full.predict, full.data.predict)
+    
+    ensemble.predict <- data.frame(predict(stack.models[[i]], full.data, type="prob")[,2]);
+    corrected.predict <- corrected.predict + ensemble.predict/ c.parameters[i]
+    }
+    
+    corr.predict <- (corrected.predict / stack.size)
+    corrected.predict <- corr.predict / max(corr.predict)
+    rownames(corrected.predict) <- rownames(full.data)
+    colnames(corrected.predict) <- 'corrected.predict'
+    
+    average.predict <- data.frame(rowMeans(full.predict))
+    colnames(average.predict) <- 'average.predict'
+    
+    model.result <- list()
+    model.result$c <- c.parameters
+    model.result$TP <- TP.parameters
+    model.result$TN <- TN.parameters
+    model.result$FP <- FP.parameters
+    model.result$FN <- FN.parameters
+    model.result$model <- stack.models
+    model.result$avgpredict <- average.predict
+    model.result$correctedpredict <- corrected.predict
+    
+    return(model.result)
+}
+
+```
+
+## Extreme Gradient Boosting
+
+Extreme Gradient Boosting was also evaluated based on the same techniques utilised for the other classification methods.
+
+```{r classif_xgb, echo=TRUE}
+
+xgbEnsemble <- function(full.data, stack.size, positive.substrate, negative.substrate, negative.size, fold.n, negative.substrate.flag, seedn, validation.flag, validation.substrate, seed.flag) {
+  
+    # Configure Data
+    positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+    
+    unlabelled.data <- subset(full.data, !rownames(full.data) %in% rownames(positive.substrate))
+    
+    if(validation.flag==1){
+        positive.data <- subset(positive.data, !rownames(positive.data) %in% rownames(validation.substrate))
+        unlabelled.data <- subset(unlabelled.data, !rownames(unlabelled.data) %in% rownames(validation.substrate))
+    }
+    
+    # Initialise Parameters
+    stack.models <- list()
+    c.parameters <- c()
+    TP.parameters <- c()
+    TN.parameters <- c()
+    FP.parameters <- c()
+    FN.parameters <- c()
+    full.predict <- c()
+    corrected.predict <- 0
+    
+    other.data <- unlabelled.data
+    
+    for (i in 1:stack.size){
+    
+    if (seed.flag == TRUE){
+      set.seed(i)
+    }
+    
+    #print(i)
+    # Sample Data
+    if (negative.substrate.flag == 1 && i == 1){
+        
+        if (nrow(positive.substrate) > nrow(negative.substrate)){
+        
+        #positive.data.rowname <- rownames(positive.substrate)[sample(1:nrow(positive.substrate), size = negative.size, replace = FALSE)]
+        #positive.data <- subset(positive.data, rownames(positive.data) %in% positive.data.rowname)
+        
+        n <- nrow(negative.substrate)
+        
+        } else{
+        
+        n <- negative.size
+        }
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.substrate)[sample(1:nrow(negative.substrate), size = n, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else if (negative.substrate.flag == 1){
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data <- subset(negative.data, !rownames(negative.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else {
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    }
+    
+    
+    # Assign class data
+    Class <- as.factor(rep(c(1, 0), times=c(nrow(positive.data), nrow(negative.data))))
+    
+    # Combine data rows
+    subset.data <- rbind(positive.data, negative.data)
+    
+    # Combine subset data and class columns
+    subset.data <- cbind(subset.data, Class)
+    
+    # Create folds based on fold.n values
+    fold <- createFolds(Class, fold.n);
+    
+    # Create train and test data
+    training.data <- subset.data[-fold$Fold1,]
+    testing.data <- subset.data[fold$Fold1,]
+    
+    # Set control parameters for training
+    dtrain <- xgb.DMatrix(data = as.matrix(training.data[,-ncol(training.data)]), label = as.numeric(as.character(training.data$Class)))
+    stack.model <- xgboost(data = dtrain, max.depth = 2, eta = 1, nthread = 2, nround = 2, objective = "binary:logistic", verbose=0, save_period = NULL)
+    
+    # Validate test data
+    testing.data.rowname <- rownames(testing.data)[which(testing.data$Class == 1)]
+    testing.data.noclass <- xgb.DMatrix(data=as.matrix(subset(testing.data, rownames(testing.data) %in% testing.data.rowname, select = colnames(testing.data)[-dim(testing.data)[2]])))
+    
+    testing.data.all <- xgb.DMatrix(data=as.matrix(subset(testing.data, select = colnames(testing.data)[-dim(testing.data)[2]])))
+    
+    test.positive.predict <- predict(stack.model, newdata=testing.data.noclass)[which(testing.data$Class == 1)]
+    
+    test.predict <- as.numeric(predict(stack.model, newdata=testing.data.all)>0.5)
+    
+    TP.parameters <- c(TP.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 1]))
+    TN.parameters <- c(TN.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 0]))
+    FP.parameters <- c(FP.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 0]))
+    FN.parameters <- c(FN.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 1]))
+    
+    c.temp <- sum(test.positive.predict)/length(test.positive.predict)
+        
+    c.parameters <- c(c.parameters, c.temp)
+    
+    # Train all the subset data
+    dtrain <- xgb.DMatrix(data = as.matrix(subset.data[,-ncol(subset.data)]), label = as.numeric(as.character(subset.data$Class)))
+    stack.model <- xgboost(data = dtrain, max.depth = 2, eta = 1, nthread = 2, nround = 2, objective = "binary:logistic", verbose=0, save_period = NULL)
+    
+    stack.models[[i]] <- stack.model
+    
+    full.data.predict <- predict(stack.model, newdata=xgb.DMatrix(data=as.matrix(full.data)))
+    
+    full.predict <- cbind(full.predict, full.data.predict)
+    
+    ensemble.predict <- data.frame(predict(stack.models[[i]], newdata=xgb.DMatrix(data=as.matrix(full.data))));
+    corrected.predict <- corrected.predict + ensemble.predict/ c.parameters[i]
+    }
+    
+    corr.predict <- (corrected.predict / stack.size)
+    corrected.predict <- corr.predict / max(corr.predict)
+    rownames(corrected.predict) <- rownames(full.data)
+    colnames(corrected.predict) <- 'corrected.predict'
+    
+    average.predict <- data.frame(rowMeans(full.predict))
+    rownames(average.predict) <- rownames(full.data)
+    colnames(average.predict) <- 'average.predict'
+    
+    model.result <- list()
+    model.result$c <- c.parameters
+    model.result$TP <- TP.parameters
+    model.result$TN <- TN.parameters
+    model.result$FP <- FP.parameters
+    model.result$FN <- FN.parameters
+    model.result$model <- stack.models
+    model.result$avgpredict <- average.predict
+    model.result$correctedpredict <- corrected.predict
+    
+    return(model.result)
+}
+
+```
+
+## Random Forest
+
+Random Forest was yet another classification technique examined for performance.
+
+```{r classif_rf, echo=TRUE}
+
+rfEnsemble <- function(full.data, stack.size, positive.substrate, negative.substrate, negative.size, fold.n, negative.substrate.flag, seedn, validation.flag, validation.substrate, seed.flag) {
+  
+    # Configure Data
+    positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+    
+    unlabelled.data <- subset(full.data, !rownames(full.data) %in% rownames(positive.substrate))
+    
+    if(validation.flag==1){
+        positive.data <- subset(positive.data, !rownames(positive.data) %in% rownames(validation.substrate))
+        unlabelled.data <- subset(unlabelled.data, !rownames(unlabelled.data) %in% rownames(validation.substrate))
+    }
+    
+    # Initialise Parameters
+    stack.models <- list()
+    c.parameters <- c()
+    TP.parameters <- c()
+    TN.parameters <- c()
+    FP.parameters <- c()
+    FN.parameters <- c()
+    full.predict <- c()
+    validation.predict <- c()
+    corrected.predict <- 0
+    
+    other.data <- unlabelled.data
+    
+    for (i in 1:stack.size){
+    
+    if (seed.flag == TRUE){
+      set.seed(i)
+    }
+      
+    #print(i)
+    # Sample Data
+    if (negative.substrate.flag == 1 && i == 1){
+        
+        if (nrow(positive.substrate) > nrow(negative.substrate)){
+        
+        #positive.data.rowname <- rownames(positive.substrate)[sample(1:nrow(positive.substrate), size = negative.size, replace = FALSE)]
+        #positive.data <- subset(positive.data, rownames(positive.data) %in% positive.data.rowname)
+        
+        n <- nrow(negative.substrate)
+        
+        } else{
+        
+        n <- negative.size
+        }
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.substrate)[sample(1:nrow(negative.substrate), size = n, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else if (negative.substrate.flag == 1){
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data <- subset(negative.data, !rownames(negative.data) %in% rownames(negative.substrate))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    } else {
+        
+        positive.data <- subset(full.data, rownames(full.data) %in% rownames(positive.substrate))
+        
+        negative.data <- subset(full.data, rownames(full.data) %in% rownames(other.data))
+        negative.data.rowname <- rownames(negative.data)[sample(1:nrow(other.data), size = negative.size, replace = FALSE)]
+        negative.data <- subset(negative.data, rownames(negative.data) %in% negative.data.rowname)
+        
+    }
+    
+    
+    # Assign class data
+    Class <- as.factor(rep(c("positive", "negative"), times=c(nrow(positive.data), nrow(negative.data))))
+    
+    # Combine data rows
+    subset.data <- rbind(positive.data, negative.data)
+    
+    # Combine subset data and class columns
+    subset.data <- cbind(subset.data, Class)
+    
+    # Create folds based on fold.n values
+    fold <- createFolds(Class, fold.n);
+    
+    # Create train and test data
+    training.data <- subset.data[-fold$Fold1,]
+    testing.data <- subset.data[fold$Fold1,]
+    
+    # Set control parameters for training
+    stack.model <- randomForest(Class~., data=training.data, importance=TRUE)
+    
+    # Validate test data
+    testing.data.rowname <- rownames(testing.data)[which(testing.data$Class == 'positive')]
+    testing.data.noclass <- subset(testing.data, rownames(testing.data) %in% testing.data.rowname, select = colnames(testing.data)[-dim(testing.data)[2]])
+    
+    testing.data.all <- subset(testing.data, select = colnames(testing.data)[-dim(testing.data)[2]])
+    
+    test.positive.predict <- predict(stack.model, newdata=testing.data.noclass, type="prob")[,2]
+    
+    test.predict <- as.factor(predict(stack.model, newdata=testing.data.all))
+    
+    TP.parameters <- c(TP.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 'positive']))
+    TN.parameters <- c(TN.parameters, sum((testing.data$Class == test.predict)[testing.data$Class == 'negative']))
+    FP.parameters <- c(FP.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 'negative']))
+    FN.parameters <- c(FN.parameters, sum((testing.data$Class != test.predict)[testing.data$Class == 'positive']))
+    
+    c.temp <- sum(test.positive.predict)/length(test.positive.predict)
+        
+    c.parameters <- c(c.parameters, c.temp)
+    
+    # Train all the subset data
+    stack.model <- randomForest(Class~., data=subset.data, importance=TRUE)
+    
+    stack.models[[i]] <- stack.model
+    
+    full.data.predict <- predict(stack.model, newdata=full.data, type="prob")[,2]
+    
+    full.predict <- cbind(full.predict, full.data.predict)
+    
+    ensemble.predict <- data.frame(predict(stack.model, newdata=full.data, type="prob")[,2]);
+    corrected.predict <- corrected.predict + ensemble.predict/ c.parameters[i]
+    }
+    
+    corr.predict <- (corrected.predict / stack.size)
+    corrected.predict <- corr.predict / max(corr.predict)
+    rownames(corrected.predict) <- rownames(full.data)
+    colnames(corrected.predict) <- 'corrected.predict'
+    
+    average.predict <- data.frame(rowMeans(full.predict))
+    colnames(average.predict) <- 'average.predict'
+    
+    model.result <- list()
+    model.result$c <- c.parameters
+    model.result$TP <- TP.parameters
+    model.result$TN <- TN.parameters
+    model.result$FP <- FP.parameters
+    model.result$FN <- FN.parameters
+    model.result$model <- stack.models
+    model.result$avgpredict <- average.predict
+    model.result$correctedpredict <- corrected.predict
+    
+    return(model.result)
+}
+
+```
+
+## Simulate Decision Boundaries
+### Generate Testing Data
+
+In order to evaluate each classification technique, we first evaluated performance on a purely synthetic dataset. This process involved using sensible assumptions, we derived the following:
+- 1% as unlabel positives
+- 0.1% as known positives
+- Features bounded between 0-9
+
+```{r gen_test, fig.align="center", echo=TRUE}
+# Create negative class sample with 2 descriptive features
+set.seed(7)
+f1 <- rnorm(5000, mean=4.5, sd = 0.6)
+set.seed(8)
+f2 <- rnorm(5000, mean=4.5, sd = 0.6)
+N1.data <- cbind(f1, f2)
+
+set.seed(5)
+f1 <- rnorm(5000, mean=3, sd = 0.6)
+set.seed(6)
+f2 <- rnorm(5000, mean=3, sd = 0.6)
+N2.data <- cbind(f1, f2)
+N.data <- data.frame(rbind(N1.data, N2.data))
+rownames(N.data) <- paste("N",seq(1:nrow(N.data)),sep="")
+
+# Create positive class sample with 2 descriptive features
+set.seed(3)
+f1 <- rnorm(220, mean=6, sd = 0.6)
+set.seed(4)
+f2 <- rnorm(220, mean=6, sd = 0.6)
+P.data <- cbind(f1, f2)
+
+# Generate known positive rows
+known <- sample(1:nrow(P.data),20,replace=FALSE)
+
+# Generate unlabelled positive data
+UP.data <- data.frame(P.data[-known,])
+rownames(UP.data) <- paste("UP",seq(1:nrow(UP.data)),sep="")
+
+# Generate known positive data
+P.data <- data.frame(P.data[known,])
+rownames(P.data) <- paste("P",seq(1:nrow(P.data)),sep="")
+
+f1 <- seq(0, 9, by=0.01)
+f2 <- seq(0, 9, by=0.01)
+V.data <- data.frame(merge(f1, f2))
+rownames(V.data) <- paste("V",seq(1:nrow(V.data)),sep="")
+colnames(V.data) <- c('f1','f2')
+
+# Combine all data
+full.test.data <- rbind(P.data, UP.data, N.data, V.data)
+
+# Generate positive substrate
+P.substrate <- data.frame(rownames(P.data))
+rownames(P.substrate ) <- P.substrate[,1]
+
+# Generate data for the decision boundary
+V.substrate <- data.frame(rownames(V.data))
+rownames(V.substrate ) <- V.substrate[,1]
+
+plot(N.data, col="lightsalmon1", pch=16, ylim=c(0, 9), xlim=c(0, 9), main="Simulated Test Data")
+points(UP.data, col="dodgerblue3", pch=16)
+points(P.data, col="red3", pch=16)
+
+```
+
+### Execute the simulated test data
+
+Evaluation involved using the synthetic dataset as described above. We generated new sets of ensembled models, using the methodologies detailed above.
+Results were then examined. Since classes in the training datasets are balanced, we apply heuristic cutoff of 0.5
+
+```{r exec_sim, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE}
+
+# Execute the classifiers
+test.svm.result <- svmEnsemble(full.data = full.test.data, stack.size = 50, positive.substrate = P.data, negative.substrate = NULL, negative.size = nrow(P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 0, validation.substrate = NULL, seed.flag=TRUE)
+
+test.lr.result <- logisticRegressionEnsemble(full.data = full.test.data, stack.size = 50, positive.substrate = P.data, negative.substrate = NULL, negative.size = nrow(P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 0, validation.substrate = NULL, seed.flag=TRUE)
+
+test.xgb.result <- xgbEnsemble(full.data = full.test.data, stack.size = 50, positive.substrate = P.data, negative.substrate = NULL, negative.size = nrow(P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 0, validation.substrate = NULL, seed.flag=TRUE)
+
+test.rf.result <- rfEnsemble(full.data = full.test.data, stack.size = 50, positive.substrate = P.data, negative.substrate = NULL, negative.size = nrow(P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 0, validation.substrate = NULL, seed.flag=TRUE)
+
+# Collect Data
+test.prob.svm.corr <- data.frame(test.svm.result$correctedpredict[rownames(V.data),])
+colnames(test.prob.svm.corr) <- 'prob.predict'
+test.V.svm.data <- cbind(V.data, test.prob.svm.corr)
+
+p.svm.region <- test.V.svm.data[which(test.V.svm.data$prob.predict>0.5),][,1:2]
+n.svm.region <- test.V.svm.data[which(test.V.svm.data$prob.predict<=0.5),][,1:2]
+
+test.prob.lr.corr <- data.frame(test.lr.result$correctedpredict[rownames(V.data),])
+colnames(test.prob.lr.corr) <- 'prob.predict'
+test.V.lr.data <- cbind(V.data, test.prob.lr.corr)
+
+p.lr.region <- test.V.lr.data[which(test.V.lr.data$prob.predict>0.5),][,1:2]
+n.lr.region <- test.V.lr.data[which(test.V.lr.data$prob.predict<=0.5),][,1:2]
+
+test.prob.xgb.corr <- data.frame(test.xgb.result$correctedpredict[rownames(V.data),])
+colnames(test.prob.xgb.corr) <- 'prob.predict'
+test.V.xgb.data <- cbind(V.data, test.prob.xgb.corr)
+
+p.xgb.region <- test.V.xgb.data[which(test.V.xgb.data$prob.predict>0.5),][,1:2]
+n.xgb.region <- test.V.xgb.data[which(test.V.xgb.data$prob.predict<=0.5),][,1:2]
+
+test.prob.rf.corr <- data.frame(test.rf.result$correctedpredict[rownames(V.data),])
+colnames(test.prob.rf.corr) <- 'prob.predict'
+test.V.rf.data <- cbind(V.data, test.prob.rf.corr)
+
+p.rf.region <- test.V.rf.data[which(test.V.rf.data$prob.predict>0.5),][,1:2]
+n.rf.region <- test.V.rf.data[which(test.V.rf.data$prob.predict<=0.5),][,1:2]
+
+```
+
+### Plot Decision Boundaries
+
+Visualising the performance of each model type, decision boundaries are illustrated for each technique.
+
+```{r plot_decisionboundary, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE}
+
+plot(p.svm.region, col="beige", pch=16, ylim=c(0, 9), xlim=c(0, 9), main="SVM")
+points(n.svm.region, col="blue4", pch=16)
+points(N.data, col="lightsalmon1", pch=16)
+points(UP.data, col="dodgerblue3", pch=16)
+points(P.data, col="red3", pch=16)
+
+plot(p.lr.region, col="beige", pch=16, ylim=c(0, 9), xlim=c(0, 9), main="Logistic Regression")
+points(n.lr.region, col="blue4", pch=16)
+points(N.data, col="lightsalmon1", pch=16)
+points(UP.data, col="dodgerblue3", pch=16)
+points(P.data, col="red3", pch=16)
+
+plot(p.xgb.region, col="beige", pch=16, ylim=c(0, 9), xlim=c(0, 9), main="Extreme Gradient Boosting")
+points(n.xgb.region, col="blue4", pch=16)
+points(N.data, col="lightsalmon1", pch=16)
+points(UP.data, col="dodgerblue3", pch=16)
+points(P.data, col="red3", pch=16)
+
+plot(p.rf.region, col="beige", pch=16, ylim=c(0, 9), xlim=c(0, 9), main="Random Forest")
+points(n.rf.region, col="blue4", pch=16)
+points(N.data, col="lightsalmon1", pch=16)
+points(UP.data, col="dodgerblue3", pch=16)
+points(P.data, col="red3", pch=16)
+
+```
+
+### Evaluate Classifiers using Simulated Data
+
+```{r exec_sim_classif, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE, eval=FALSE}
+
+Validation.svm.TN <- c()
+Validation.svm.TP <- c()
+Validation.lr.TN <- c()
+Validation.lr.TP <- c()
+Validation.xgb.TN <- c()
+Validation.xgb.TP <- c()
+Validation.rf.TN <- c()
+Validation.rf.TP <- c()
+
+
+for(i in 1:10){
+    set.seed(seed = NULL)
+    # Create Validation Data
+    Validation.P.data <- rbind(Valid.P.data[sample(nrow(Valid.P.data),5),],Valid.UP.data[sample(nrow(Valid.UP.data),15),])
+    Validation.N.data <- Valid.N.data[sample(nrow(Valid.N.data),20),]
+    
+    Valid.substrate <- rbind(Validation.P.data, Validation.N.data)
+    
+    # Simulate SVM
+    Valid.svm.result <- svmEnsemble(full.data = Valid.all.data, stack.size = 50, positive.substrate = Valid.P.data, negative.substrate = NULL, negative.size = nrow(Valid.P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 1, validation.substrate = Valid.substrate, seed.flag=TRUE)
+    
+    temp <- subset(Valid.svm.result$correctedpredict, rownames(Valid.svm.result$correctedpredict) %in% rownames(Validation.P.data))
+    Validation.svm.TP <- c(Validation.svm.TP, length(which(temp>0.5)))
+    
+    temp <- subset(Valid.svm.result$correctedpredict, rownames(Valid.svm.result$correctedpredict) %in% rownames(Validation.N.data))
+    Validation.svm.TN <- c(Validation.svm.TN, length(which(temp<=0.5)))
+    
+    # Simulate LR
+    Valid.lr.result <- logisticRegressionEnsemble(full.data = Valid.all.data, stack.size = 50, positive.substrate = Valid.P.data, negative.substrate = NULL, negative.size = nrow(Valid.P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 1, validation.substrate = Valid.substrate, seed.flag=TRUE)
+    
+    temp <- subset(Valid.lr.result$correctedpredict, rownames(Valid.lr.result$correctedpredict) %in% rownames(Validation.P.data))
+    Validation.lr.TP <- c(Validation.lr.TP, length(which(temp>0.5)))
+    
+    temp <- subset(Valid.lr.result$correctedpredict, rownames(Valid.lr.result$correctedpredict) %in% rownames(Validation.N.data))
+    Validation.lr.TN <- c(Validation.lr.TN, length(which(temp<=0.5)))
+    
+    # Simulate XGB
+    Valid.xgb.result <- xgbEnsemble(full.data = Valid.all.data, stack.size = 50, positive.substrate = Valid.P.data, negative.substrate = NULL, negative.size = nrow(Valid.P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 1, validation.substrate = Valid.substrate, seed.flag=TRUE)
+    
+    temp <- subset(Valid.xgb.result$correctedpredict, rownames(Valid.xgb.result$correctedpredict) %in% rownames(Validation.P.data))
+    Validation.xgb.TP <- c(Validation.xgb.TP, length(which(temp>0.5)))
+    
+    temp <- subset(Valid.xgb.result$correctedpredict, rownames(Valid.xgb.result$correctedpredict) %in% rownames(Validation.N.data))
+    Validation.xgb.TN <- c(Validation.xgb.TN, length(which(temp<=0.5)))
+    
+    # Simulate Random Forest
+    Valid.rf.result <- rfEnsemble(full.data = Valid.all.data, stack.size = 50, positive.substrate = Valid.P.data, negative.substrate = NULL, negative.size = nrow(Valid.P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 1, validation.substrate = Valid.substrate, seed.flag=TRUE)
+    
+    temp <- subset(Valid.rf.result$correctedpredict, rownames(Valid.rf.result$correctedpredict) %in% rownames(Validation.P.data))
+    Validation.rf.TP <- c(Validation.rf.TP, length(which(temp>0.5)))
+    
+    temp <- subset(Valid.rf.result$correctedpredict, rownames(Valid.rf.result$correctedpredict) %in% rownames(Validation.N.data))
+    Validation.rf.TN <- c(Validation.rf.TN, length(which(temp<=0.5)))
+}
+
+Validation.svm.FN <- rep(20, times=10) - Validation.svm.TP
+Validation.svm.FP <- rep(20, times=10) - Validation.svm.TN
+Validation.lr.FN <- rep(20, times=10) - Validation.lr.TP
+Validation.lr.FP <- rep(20, times=10) - Validation.lr.TN
+Validation.xgb.FN <- rep(20, times=10) - Validation.xgb.TP
+Validation.xgb.FP <- rep(20, times=10) - Validation.xgb.TN
+Validation.rf.FN <- rep(20, times=10) - Validation.rf.TP
+Validation.rf.FP <- rep(20, times=10) - Validation.rf.TN
+
+# SVM Metrics
+svm.sen <- Validation.svm.TP/(Validation.svm.TP + Validation.svm.FN)
+svm.spe <- Validation.svm.TN/(Validation.svm.TN + Validation.svm.FP)
+svm.f1 <- 2*Validation.svm.TP/(2*Validation.svm.TP + Validation.svm.FP + Validation.svm.FN)
+svm.gm <- sqrt((Validation.svm.TP/(Validation.svm.TP + Validation.svm.FN)) * (Validation.svm.TP/(Validation.svm.TP + Validation.svm.FP)))
+svm.mcc <- ((Validation.svm.TP * Validation.svm.TN)-(Validation.svm.FP * Validation.svm.FN))/sqrt((Validation.svm.TP + Validation.svm.FP)*(Validation.svm.TP + Validation.svm.FN)*(Validation.svm.TN + Validation.svm.FP)*(Validation.svm.TN + Validation.svm.FN))
+
+# LR Metrics
+lr.sen <- Validation.lr.TP/(Validation.lr.TP + Validation.lr.FN)
+lr.spe <- Validation.lr.TN/(Validation.lr.TN + Validation.lr.FP)
+lr.f1 <- 2*Validation.lr.TP/(2*Validation.lr.TP + Validation.lr.FP + Validation.lr.FN)
+lr.gm <- sqrt((Validation.lr.TP/(Validation.lr.TP + Validation.lr.FN)) * (Validation.lr.TP/(Validation.lr.TP + Validation.lr.FP)))
+lr.mcc <- ((Validation.lr.TP * Validation.lr.TN)-(Validation.lr.FP * Validation.lr.FN))/sqrt((Validation.lr.TP + Validation.lr.FP)*(Validation.lr.TP + Validation.lr.FN)*(Validation.lr.TN + Validation.lr.FP)*(Validation.lr.TN + Validation.lr.FN))
+
+# XGB Metrics
+xgb.sen <- Validation.xgb.TP/(Validation.xgb.TP + Validation.xgb.FN)
+xgb.spe <- Validation.xgb.TN/(Validation.xgb.TN + Validation.xgb.FP)
+xgb.f1 <- 2*Validation.xgb.TP/(2*Validation.xgb.TP + Validation.xgb.FP + Validation.xgb.FN)
+xgb.gm <- sqrt((Validation.xgb.TP/(Validation.xgb.TP + Validation.xgb.FN)) * (Validation.xgb.TP/(Validation.xgb.TP + Validation.xgb.FP)))
+xgb.mcc <- ((Validation.xgb.TP * Validation.xgb.TN)-(Validation.xgb.FP * Validation.xgb.FN))/sqrt((Validation.xgb.TP + Validation.xgb.FP)*(Validation.xgb.TP + Validation.xgb.FN)*(Validation.xgb.TN + Validation.xgb.FP)*(Validation.xgb.TN + Validation.xgb.FN))
+
+# Random Forest Metrics
+rf.sen <- Validation.rf.TP/(Validation.rf.TP + Validation.rf.FN)
+rf.spe <- Validation.rf.TN/(Validation.rf.TN + Validation.rf.FP)
+rf.f1 <- 2*Validation.rf.TP/(2*Validation.rf.TP + Validation.rf.FP + Validation.rf.FN)
+rf.gm <- sqrt((Validation.rf.TP/(Validation.rf.TP + Validation.rf.FN)) * (Validation.rf.TP/(Validation.rf.TP + Validation.rf.FP)))
+rf.mcc <- ((Validation.rf.TP * Validation.rf.TN)-(Validation.rf.FP * Validation.rf.FN))/sqrt((Validation.rf.TP + Validation.rf.FP)*(Validation.rf.TP + Validation.rf.FN)*(Validation.rf.TN + Validation.rf.FP)*(Validation.rf.TN + Validation.rf.FN))
+
+# Display Result
+Validate.all.result <- rbind(cbind(mean(svm.sen), mean(svm.spe), mean(svm.f1), mean(svm.gm), mean(svm.mcc)),cbind(mean(lr.sen), mean(lr.spe), mean(lr.f1), mean(lr.gm), mean(lr.mcc)),cbind(mean(xgb.sen), mean(xgb.spe), mean(xgb.f1), mean(xgb.gm), mean(xgb.mcc)),cbind(mean(rf.sen), mean(rf.spe), mean(rf.f1), mean(rf.gm), mean(rf.mcc)))
+colnames(Validate.all.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(Validate.all.result) <- c("SVM", "LR", "XGB", "RF")
+
+# Standard Deviation
+Validate.all.sd.result <- rbind(cbind(sd(svm.sen), sd(svm.spe), sd(svm.f1), sd(svm.gm), sd(svm.mcc)),cbind(sd(lr.sen), sd(lr.spe), sd(lr.f1), sd(lr.gm), sd(lr.mcc)),cbind(sd(xgb.sen), sd(xgb.spe), sd(xgb.f1), sd(xgb.gm), sd(xgb.mcc)),cbind(sd(rf.sen), sd(rf.spe), sd(rf.f1), sd(rf.gm), sd(rf.mcc)))
+colnames(Validate.all.sd.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(Validate.all.sd.result) <- c("SVM", "LR", "XGB", "RF")
+
+```
+
+### Display metrics of simulated data
+
+Based on our experimentation, we assess the performance of each technique idependantly and assess models for superiour performance.
+
+```{r disp_sim_classif, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE}
+
+kable(Validate.all.result,format="html", caption="Validation Measure Result")
+
+kable(Validate.all.sd.result,format="html", caption="Validation Standard Deviation Measure Result")
+
+```
+
+### Average vs Corrected Prediction
+
+Our objective is to identify unlabelled positive substrates of both mTOR and Akt kinases. Model performance, with and without correction was applied to the synthetic dataset. Our results demostrate that a positive boost to the ensemble models is more likely to identify these substrates.
+
+```{r avg_corr, fig.align="center", echo=TRUE}
+# Average Prediction
+test.prob.svm.avg <- data.frame(test.svm.result$avgpredict[rownames(V.data),])
+colnames(test.prob.svm.avg) <- 'prob.predict'
+test.V.svm.data <- cbind(V.data, test.prob.svm.avg)
+
+p.svm.region <- test.V.svm.data[which(test.V.svm.data$prob.predict>0.5),][,1:2]
+n.svm.region <- test.V.svm.data[which(test.V.svm.data$prob.predict<=0.5),][,1:2]
+
+plot(p.svm.region, col="beige", pch=16, ylim=c(0, 9), xlim=c(0, 9), main="SVM - Average")
+points(n.svm.region, col="blue4", pch=16)
+points(N.data, col="lightsalmon1", pch=16)
+points(UP.data, col="dodgerblue3", pch=16)
+points(P.data, col="red3", pch=16)
+
+# Corrected Prediction
+test.prob.svm.corr <- data.frame(test.svm.result$correctedpredict[rownames(V.data),])
+colnames(test.prob.svm.corr) <- 'prob.predict'
+test.V.svm.data <- cbind(V.data, test.prob.svm.corr)
+
+p.svm.region <- test.V.svm.data[which(test.V.svm.data$prob.predict>0.5),][,1:2]
+n.svm.region <- test.V.svm.data[which(test.V.svm.data$prob.predict<=0.5),][,1:2]
+
+plot(p.svm.region, col="beige", pch=16, ylim=c(0, 9), xlim=c(0, 9), main="SVM - Corrected")
+points(n.svm.region, col="blue4", pch=16)
+points(N.data, col="lightsalmon1", pch=16)
+points(UP.data, col="dodgerblue3", pch=16)
+points(P.data, col="red3", pch=16)
+
+```
+
+### Evaluate Classifiers using Simulated Data for Average vs Corrected
+
+A similar approach was applied to each classification technique and evaluated.
+
+```{r exec_sim_corr_avg, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE, eval=FALSE}
+
+Validation.svm.corr.TN <- c()
+Validation.svm.corr.TP <- c()
+Validation.svm.avg.TN <- c()
+Validation.svm.avg.TP <- c()
+
+
+for(i in 1:10){
+    set.seed(seed = NULL)
+    # Create Validation Data
+    Validation.P.data <- rbind(Valid.P.data[sample(nrow(Valid.P.data),5),],Valid.UP.data[sample(nrow(Valid.UP.data),15),])
+    Validation.N.data <- Valid.N.data[sample(nrow(Valid.N.data),20),]
+    
+    Valid.substrate <- rbind(Validation.P.data, Validation.N.data)
+    
+    # Simulate SVM
+    Valid.svm.result <- svmEnsemble(full.data = Valid.all.data, stack.size = 50, positive.substrate = Valid.P.data, negative.substrate = NULL, negative.size = nrow(Valid.P.data), fold.n = 3, negative.substrate.flag = 0, validation.flag = 1, validation.substrate = Valid.substrate, seed.flag=TRUE)
+    
+    # Corrected
+    temp <- subset(Valid.svm.result$correctedpredict, rownames(Valid.svm.result$correctedpredict) %in% rownames(Validation.P.data))
+    Validation.svm.corr.TP <- c(Validation.svm.corr.TP, length(which(temp>0.5)))
+    
+    temp <- subset(Valid.svm.result$correctedpredict, rownames(Valid.svm.result$correctedpredict) %in% rownames(Validation.N.data))
+    Validation.svm.corr.TN <- c(Validation.svm.corr.TN, length(which(temp<=0.5)))
+    
+    # Average
+    temp <- subset(Valid.svm.result$avgpredict, rownames(Valid.svm.result$avgpredict) %in% rownames(Validation.P.data))
+    Validation.svm.avg.TP <- c(Validation.svm.avg.TP, length(which(temp>0.5)))
+    
+    temp <- subset(Valid.svm.result$avgpredict, rownames(Valid.svm.result$avgpredict) %in% rownames(Validation.N.data))
+    Validation.svm.avg.TN <- c(Validation.svm.avg.TN, length(which(temp<=0.5)))
+    
+}
+
+Validation.svm.corr.FN <- rep(20, times=10) - Validation.svm.corr.TP
+Validation.svm.corr.FP <- rep(20, times=10) - Validation.svm.corr.TN
+Validation.svm.avg.FN <- rep(20, times=10) - Validation.svm.avg.TP
+Validation.svm.avg.FP <- rep(20, times=10) - Validation.svm.avg.TN
+
+
+# SVM Metrics Corrected
+svm.corr.sen <- Validation.svm.corr.TP/(Validation.svm.corr.TP + Validation.svm.corr.FN)
+svm.corr.spe <- Validation.svm.corr.TN/(Validation.svm.corr.TN + Validation.svm.corr.FP)
+svm.corr.f1 <- 2*Validation.svm.corr.TP/(2*Validation.svm.corr.TP + Validation.svm.corr.FP + Validation.svm.corr.FN)
+svm.corr.gm <- sqrt((Validation.svm.corr.TP/(Validation.svm.corr.TP + Validation.svm.corr.FN)) * (Validation.svm.corr.TP/(Validation.svm.corr.TP + Validation.svm.corr.FP)))
+svm.corr.mcc <- ((Validation.svm.corr.TP * Validation.svm.corr.TN)-(Validation.svm.corr.FP * Validation.svm.corr.FN))/sqrt((Validation.svm.corr.TP + Validation.svm.corr.FP)*(Validation.svm.corr.TP + Validation.svm.corr.FN)*(Validation.svm.corr.TN + Validation.svm.corr.FP)*(Validation.svm.corr.TN + Validation.svm.corr.FN))
+
+# SVM Metrics Average
+svm.avg.sen <- Validation.svm.avg.TP/(Validation.svm.avg.TP + Validation.svm.avg.FN)
+svm.avg.spe <- Validation.svm.avg.TN/(Validation.svm.avg.TN + Validation.svm.avg.FP)
+svm.avg.f1 <- 2*Validation.svm.avg.TP/(2*Validation.svm.avg.TP + Validation.svm.avg.FP + Validation.svm.avg.FN)
+svm.avg.gm <- sqrt((Validation.svm.avg.TP/(Validation.svm.avg.TP + Validation.svm.avg.FN)) * (Validation.svm.avg.TP/(Validation.svm.avg.TP + Validation.svm.avg.FP)))
+svm.avg.mcc <- ((Validation.svm.avg.TP * Validation.svm.avg.TN)-(Validation.svm.avg.FP * Validation.svm.avg.FN))/sqrt((Validation.svm.avg.TP + Validation.svm.avg.FP)*(Validation.svm.avg.TP + Validation.svm.avg.FN)*(Validation.svm.avg.TN + Validation.svm.avg.FP)*(Validation.svm.avg.TN + Validation.svm.avg.FN))
+
+# Display Result
+Validate.corravg.result <- rbind(cbind(mean(svm.corr.sen), mean(svm.corr.spe), mean(svm.corr.f1), mean(svm.corr.gm), mean(svm.corr.mcc)),cbind(mean(svm.avg.sen), mean(svm.avg.spe), mean(svm.avg.f1), mean(svm.avg.gm), mean(svm.avg.mcc)))
+colnames(Validate.corravg.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(Validate.corravg.result) <- c("SVM-Corrected", "SVM-Average")
+
+# Standard Deviation
+Validate.corravg.sd.result <- rbind(cbind(sd(svm.corr.sen), sd(svm.corr.spe), sd(svm.corr.f1), sd(svm.corr.gm), sd(svm.corr.mcc)),cbind(sd(svm.avg.sen), sd(svm.avg.spe), sd(svm.avg.f1), sd(svm.avg.gm), sd(svm.avg.mcc)))
+colnames(Validate.corravg.sd.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(Validate.corravg.sd.result) <- c("SVM-Corrected", "SVM-Average")
+
+```
+
+### Display metrics of simulated data for Average vs Corrected
+
+Using synthetic data, we have established the value in apply model correction.
+
+```{r disp_sim_corr_avg, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE}
+
+kable(Validate.corravg.result,format="html", caption="Validation Average vs Corrected Result")
+
+kable(Validate.corravg.sd.result,format="html", caption="Validation Standard Deviation Average vs Corrected Result")
+
+```
+
+# 4. Evaluation
+## Ensemble Size
+### Prepare Akt Data
+
+/*
+  - Preparing for Akt pred.
+  - Using phospo, motif, BLOSUM, and PhosPo + Motif, PhosPo +...
+*/
+
+```{r prep_akt, fig.align="center", echo=TRUE}
+
+# Prepare Akt phosphoproteomic data
+full.akt.phospho.data <- all.data[,-1]
+
+# Prepare Akt motif data
+akt.motif.score <- data.frame(akt.seq.pssm.score[,dim(akt.seq.pssm.score)[2]])
+colnames(akt.motif.score) <- 'akt.motif.score'
+rownames(akt.motif.score) <- rownames(all.data)
+full.akt.motif.data <- akt.motif.score
+
+# Prepare Akt pairwise BLOSUM62 similarity data
+full.akt.parseq.data <- akt.parSeqSim.score
+
+# # Prepare Akt sparse matrix data
+# full.akt.sparse.data <- akt.seq.sparse.data
+
+# Prepare Akt phosphoproteomic and motif data
+akt.motif.score <- data.frame(akt.seq.pssm.score[,dim(akt.seq.pssm.score)[2]])
+colnames(akt.motif.score) <- 'akt.motif.score'
+full.akt.phospho.motif.data <- cbind(all.data[,-1], akt.motif.score)
+
+# Prepare Akt phosphoproteomic and parseq data
+akt.parseq.score <- data.frame(akt.parSeqSim.score$akt.parSeqSim.score)
+colnames(akt.parseq.score) <- 'akt.parseq.score'
+full.akt.phospho.parseq.data <- cbind(all.data[,-1], akt.parseq.score)
+
+# Prepare Akt phosphoproteomic and sparse data
+full.akt.phospho.sparse.data <- cbind(all.data[,-1], akt.seq.sparse.data)
+
+```
+
+### Prepare mTOR Data
+
+/*
+  - Determine ensemble size
+  - Complexity increases, with marginal improvement
+  - Correlate the results of different stack sizes looking for stability
+  
+*/
+
+```{r prep_mtor, fig.align="center", echo=TRUE}
+
+# Prepare mTOR phosphoproteomic data
+full.mtor.phospho.data <- all.data[,-1]
+
+# Prepare mTOR motif data
+mtor.motif.score <- data.frame(mtor.seq.pssm.score[,dim(mtor.seq.pssm.score)[2]])
+colnames(mtor.motif.score) <- 'mtor.motif.score'
+rownames(mtor.motif.score) <- rownames(all.data)
+full.mtor.motif.data <- mtor.motif.score
+
+# Prepare mTOR pairwise BLOSUM62 similarity data
+full.mtor.parseq.data <- mtor.parSeqSim.score
+
+# Prepare mTOR sparse matrix data
+full.mtor.sparse.data <- mtor.seq.sparse.data
+
+# Prepare mTOR phosphoproteomic and motif data
+mtor.motif.score <- data.frame(mtor.seq.pssm.score[,dim(mtor.seq.pssm.score)[2]])
+colnames(mtor.motif.score) <- 'mtor.motif.score'
+full.mtor.phospho.motif.data <- cbind(all.data[,-1], mtor.motif.score)
+
+# Prepare mTOR phosphoproteomic and parseq data
+mtor.parseq.score <- data.frame(mtor.parSeqSim.score$mtor.parSeqSim.score)
+colnames(mtor.parseq.score) <- 'mtor.parseq.score'
+full.mtor.phospho.parseq.data <- cbind(all.data[,-1], mtor.parseq.score)
+
+# Prepare mTOR phosphoproteomic and sparse data
+full.mtor.phospho.sparse.data <- cbind(all.data[,-1], mtor.seq.sparse.data)
+
+```
+
+## Load PreProcessData.RData
+
+/*
+  - We use pregenerated data due to processing time
+*/
+
+```{r load_ppdatar, fig.align="center", echo=TRUE}
+
+load("PreProcessedData.RData")
+
+```
+
+### Execute the Ensemble Size for Akt
+
+/*
+  - Stack size of 50 for the SVM ensemble
+*/
+
+```{r ensemble_akt, fig.align="center", echo=TRUE, eval=FALSE}
+
+akt.ensemble.size <- c(1, seq(10,80,10))
+akt.ensemble.corr <- c()
+
+for(i in akt.ensemble.size){
+
+    akt.corr <- matrix(nrow = nrow(full.akt.phospho.motif.data), ncol = 0)
+
+    for(j in 1:10){
+    
+        full.akt.phospho.motif.data.svm.result <- svmEnsemble(full.data = full.akt.phospho.motif.data, stack.size = i, positive.substrate = akt, negative.substrate = mtor, negative.size = akt.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = akt.validation.substrate, seed.flag = FALSE)
+        akt.corr <- cbind(akt.corr, full.akt.phospho.motif.data.svm.result$correctedpredict)
+
+    }
+            
+    temp <- cor(akt.corr)
+    akt.ensemble.corr <- c(akt.ensemble.corr, min(temp))
+}
+
+```
+
+## Plot mTOR Ensemble
+
+```{r plot_ensemble_akt, fig.align="center", echo=TRUE}
+
+plot(akt.ensemble.size, akt.ensemble.corr, type = "o", col="dodgerblue", lwd=2, pch=20, cex=2, xlab="Ensemble Size", ylab="Correlation", main="Akt")
+
+```
+
+### Execute the Ensemble Size for mTOR
+
+/*
+  - Ditto.
+*/
+
+```{r ensemble_mtor, fig.align="center", echo=TRUE, eval=FALSE}
+
+mtor.ensemble.size <- c(1, seq(10,80,10))
+mtor.ensemble.corr <- c()
+
+for(i in mtor.ensemble.size){
+
+    mtor.corr <- matrix(nrow = nrow(full.mtor.phospho.motif.data), ncol = 0)
+
+    for(j in 1:10){
+    
+        full.mtor.phospho.motif.data.svm.result <- svmEnsemble(full.data = full.mtor.phospho.motif.data, stack.size = i, positive.substrate = mtor, negative.substrate = akt, negative.size = mtor.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = mtor.validation.substrate, seed.flag = FALSE)
+        mtor.corr <- cbind(mtor.corr, full.mtor.phospho.motif.data.svm.result$correctedpredict)
+        
+    }
+    
+    temp <- cor(mtor.corr)
+    mtor.ensemble.corr <- c(mtor.ensemble.corr, min(temp))
+}
+
+```
+
+## Plot mTOR Ensemble
+
+```{r plot_ensemble_mtor, fig.align="center", echo=TRUE}
+
+plot(mtor.ensemble.size, mtor.ensemble.corr, type = "o", col="lightsalmon", lwd=2, pch=20, cex=2, xlab="Ensemble Size", ylab="Correlation", main="mTOR")
+
+```
+
+## Create Validation Function
+
+/*
+  - Prepare datastructures for the results.
+*/
+
+```{r valid_function, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE}
+
+ValidateEnsemble <- function(vt.full.data, vt.stack.size, vt.positive.substrate, vt.negative.substrate, vt.negative.size, vt.fold.n, vt.negative.substrate.flag, vt.validation.flag, vt.validation.substrate, vt.seed.flag, FUN, vt.n) {
+
+    n.TN <- c()
+    p.TP <- c()
+    p.predict <- list()
+    n.predict <- list()
+    
+    for(i in 1:vt.n){
+ 
+        # Validate Sensitivity
+        p.validation.predict <- c()
+    
+        for (j in 1:nrow(vt.positive.substrate)){
+
+            validation.substrate <- subset(vt.positive.substrate,rownames(vt.positive.substrate) %in% vt.positive.substrate[j,])
+            
+            result <- FUN(full.data = vt.full.data, stack.size = vt.stack.size, positive.substrate = vt.positive.substrate, negative.substrate = vt.negative.substrate, negative.size = vt.negative.size, fold.n = vt.fold.n, negative.substrate.flag = vt.negative.substrate.flag, validation.flag = 1, validation.substrate = validation.substrate, seed.flag = vt.seed.flag)
+            
+            p.validation.predict <- c(p.validation.predict, result$correctedpredict[rownames(validation.substrate),1])
+    
+        }
+        p.predict[[i]] <- p.validation.predict
+        p.TP <- c(p.TP, length(which(p.validation.predict>0.5)))
+        
+        # Validate Specificity
+        
+        n.substrate <- data.frame(rownames(subset(vt.full.data, !rownames(vt.full.data) %in% rownames(vt.positive.substrate))))
+    rownames(n.substrate) <- n.substrate[,1]
+    colnames(n.substrate) <- 'identifier'
+        
+        n.substrate.sample <- as.character(n.substrate[sample(1:nrow(n.substrate), size=nrow(vt.positive.substrate), replace=FALSE),])
+        
+        validation.substrate <- subset(n.substrate, rownames(n.substrate) %in% n.substrate.sample)
+        #validation.substrate <- n.substrate
+        
+        result <- FUN(full.data = vt.full.data, stack.size = vt.stack.size, positive.substrate = vt.positive.substrate, negative.substrate = vt.negative.substrate, negative.size = vt.negative.size, fold.n = vt.fold.n, negative.substrate.flag = vt.negative.substrate.flag, validation.flag = 1, validation.substrate = validation.substrate, seed.flag = vt.seed.flag)
+
+        n.validation.predict <- result$correctedpredict[rownames(validation.substrate),1]
+        n.predict[[i]] <- n.validation.predict
+        n.TN <- c(n.TN, length(which(n.validation.predict<=0.5)))
+    
+    }
+    
+    # Calculate TP, TN, FP and FN
+    TP.final <- p.TP
+    TN.final <- n.TN
+    FN.final <- rep(nrow(vt.positive.substrate), times=vt.n) - TP.final
+    FP.final <- rep(nrow(vt.positive.substrate), times=vt.n) - TN.final
+
+    sen <- TP.final/(TP.final + FN.final)
+    spe <- TN.final/(TN.final + FP.final)
+    f1 <- 2*TP.final/(2*TP.final + FP.final + FN.final)
+    gm <- sqrt((TP.final/(TP.final + FN.final)) * (TP.final/(TP.final + FP.final)))
+    mcc <- ((TP.final * TN.final)-(FP.final * FN.final))/sqrt((TP.final + FP.final)*(TP.final + FN.final)*(TN.final + FP.final)*(TN.final + FN.final))
+    
+    validate.result <- list()
+    validate.result$TP <- TP.final
+    validate.result$TN <- TN.final
+    validate.result$FN <- FN.final
+    validate.result$FP <- FP.final
+    validate.result$p.predict <- p.predict
+    validate.result$n.predict <- n.predict
+    validate.result$sen <- sen
+    validate.result$spe <- spe
+    validate.result$f1 <- f1
+    validate.result$gm <- gm
+    validate.result$mcc <- mcc
+    
+    return(validate.result)
+}
+
+```
+
+## Run Validation for Akt
+
+/*
+  - Produce Akt models
+  - 
+*/
+
+```{r valid_akt, fig.align="center", echo=TRUE, eval=FALSE}
+
+# Phosphoproteomic Data
+akt.phospho.result <- ValidateEnsemble(vt.full.data = full.akt.phospho.data, vt.stack.size = 50, vt.positive.substrate = akt, vt.negative.substrate = mtor, vt.negative.size = akt.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Motif Data
+akt.motif.result <- ValidateEnsemble(vt.full.data = full.akt.motif.data, vt.stack.size = 50, vt.positive.substrate = akt, vt.negative.substrate = mtor, vt.negative.size = akt.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Pairwise BLOSUM62 similarity data
+akt.parseq.result <- ValidateEnsemble(vt.full.data = full.akt.parseq.data, vt.stack.size = 50, vt.positive.substrate = akt, vt.negative.substrate = mtor, vt.negative.size = akt.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Phosphoproteomic and Pairwise BLOSUM62 similarity Data
+akt.phospho.parseq.result <- ValidateEnsemble(vt.full.data = full.akt.phospho.parseq.data, vt.stack.size = 50, vt.positive.substrate = akt, vt.negative.substrate = mtor, vt.negative.size = akt.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Phosphoproteomic and Motif Data
+akt.phospho.motif.result <- ValidateEnsemble(vt.full.data = full.akt.phospho.motif.data, vt.stack.size = 50, vt.positive.substrate = akt, vt.negative.substrate = mtor, vt.negative.size = akt.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Plot Precision Recall Curves
+akt.phospho.p <- c()
+akt.phospho.n <- c()
+akt.motif.p <- c()
+akt.motif.n <- c()
+akt.parseq.p <- c()
+akt.parseq.n <- c()
+akt.phospho.motif.p <- c()
+akt.phospho.motif.n <- c()
+akt.phospho.parseq.p <- c()
+akt.phospho.parseq.n <- c()
+n <- length(akt.phospho.result$p.predict)
+
+for(j in 1:n){
+    
+    akt.phospho.p <- c(akt.phospho.p, akt.phospho.result$p.predict[[j]])
+    akt.phospho.n <- c(akt.phospho.n, akt.phospho.result$n.predict[[j]])
+    akt.motif.p <- c(akt.motif.p, akt.motif.result$p.predict[[j]])
+    akt.motif.n <- c(akt.motif.n, akt.motif.result$n.predict[[j]])
+    akt.parseq.p <- c(akt.parseq.p, akt.parseq.result$p.predict[[j]])
+    akt.parseq.n <- c(akt.parseq.n, akt.parseq.result$n.predict[[j]])
+    akt.phospho.motif.p <- c(akt.phospho.motif.p, akt.phospho.motif.result$p.predict[[j]])
+    akt.phospho.motif.n <- c(akt.phospho.motif.n, akt.phospho.motif.result$n.predict[[j]])
+    akt.phospho.parseq.p <- c(akt.phospho.parseq.p, akt.phospho.parseq.result$p.predict[[j]])
+    akt.phospho.parseq.n <- c(akt.phospho.parseq.n, akt.phospho.parseq.result$n.predict[[j]])
+
+}
+
+akt.class.curve <- as.factor(rep(c("positive", "negative"), times=c(length(akt.phospho.p), length(akt.phospho.n))))
+
+# Generate phospho and motif curve
+akt.phospho.curve <- roc(akt.class.curve, c(akt.phospho.p,akt.phospho.n))
+akt.motif.curve <- roc(akt.class.curve, c(akt.motif.p,akt.motif.n))
+akt.parseq.curve <- roc(akt.class.curve, c(akt.parseq.p,akt.parseq.n))
+akt.phospho.motif.curve <- roc(akt.class.curve, c(akt.phospho.motif.p,akt.phospho.motif.n))
+akt.phospho.parseq.curve <- roc(akt.class.curve, c(akt.phospho.parseq.p,akt.phospho.parseq.n))
+
+```
+
+## Plot PRC for Akt
+
+/*
+  - How well can we disguish a TP vs FN etc.
+  - 
+*/
+
+```{r plot_curve_akt, fig.align="center", echo=TRUE}
+
+plot(precision ~ recall, t(coords(akt.phospho.motif.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="dodgerblue", xlab="Recall", ylab="Precision", main="Akt - Motif")
+lines(precision ~ recall, t(coords(akt.motif.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="forestgreen", lty="dotted")
+lines(precision ~ recall, t(coords(akt.phospho.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="red", lty="twodash")
+legend("bottomleft", legend=c("Phospho & Motif", "Motif", "Phospho"), col=c("dodgerblue", "forestgreen", "red"), lty=c("solid","dotted","twodash"), cex=1, bty="n", lwd=3)
+
+plot(precision ~ recall, t(coords(akt.phospho.parseq.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="dodgerblue", xlab="Recall", ylab="Precision", main="Akt - BLOSUM62 Similarity")
+lines(precision ~ recall, t(coords(akt.parseq.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="forestgreen", lty="dotted")
+lines(precision ~ recall, t(coords(akt.phospho.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="red", lty="twodash")
+legend("bottomleft", legend=c("Phospho & BLOSUM62 Similarity", "BLOSUM62 Similarity", "Phospho"), col=c("dodgerblue", "forestgreen", "red"), lty=c("solid","dotted","twodash"), cex=1, bty="n", lwd=3)
+
+```
+
+## Summarise Akt Validation Result
+
+```{r summ_akt, fig.align="center", echo=TRUE}
+
+akt.validate.result <- rbind(cbind(mean(akt.phospho.motif.result$sen), mean(akt.phospho.motif.result$spe), mean(akt.phospho.motif.result$f1), mean(akt.phospho.motif.result$gm), mean(akt.phospho.motif.result$mcc)),cbind(mean(akt.phospho.parseq.result$sen), mean(akt.phospho.parseq.result$spe), mean(akt.phospho.parseq.result$f1), mean(akt.phospho.parseq.result$gm), mean(akt.phospho.parseq.result$mcc)),cbind(mean(akt.phospho.result$sen), mean(akt.phospho.result$spe), mean(akt.phospho.result$f1), mean(akt.phospho.result$gm), mean(akt.phospho.result$mcc)),cbind(mean(akt.motif.result$sen), mean(akt.motif.result$spe), mean(akt.motif.result$f1), mean(akt.motif.result$gm), mean(akt.motif.result$mcc)),cbind(mean(akt.parseq.result$sen), mean(akt.parseq.result$spe), mean(akt.parseq.result$f1), mean(akt.parseq.result$gm), mean(akt.parseq.result$mcc)))
+colnames(akt.validate.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(akt.validate.result) <- c("Phospho & Motif", "Phospho & BLOSUM62 Similarity", "Phospho", "Motif", "BLOSUM62 Similarity")
+
+# Standard Deviation
+akt.validate.sd.result <- rbind(cbind(sd(akt.phospho.motif.result$sen), sd(akt.phospho.motif.result$spe), sd(akt.phospho.motif.result$f1), sd(akt.phospho.motif.result$gm), sd(akt.phospho.motif.result$mcc)),cbind(sd(akt.phospho.parseq.result$sen), sd(akt.phospho.parseq.result$spe), sd(akt.phospho.parseq.result$f1), sd(akt.phospho.parseq.result$gm), sd(akt.phospho.parseq.result$mcc)),cbind(sd(akt.phospho.result$sen), sd(akt.phospho.result$spe), sd(akt.phospho.result$f1), sd(akt.phospho.result$gm), sd(akt.phospho.result$mcc)),cbind(sd(akt.motif.result$sen), sd(akt.motif.result$spe), sd(akt.motif.result$f1), sd(akt.motif.result$gm), sd(akt.motif.result$mcc)),cbind(sd(akt.parseq.result$sen), sd(akt.parseq.result$spe), sd(akt.parseq.result$f1), sd(akt.parseq.result$gm), sd(akt.parseq.result$mcc)))
+colnames(akt.validate.sd.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(akt.validate.sd.result) <- c("Phospho & Motif", "Phospho & BLOSUM62 Similarity", "Phospho", "Motif", "BLOSUM62 Similarity")
+
+# Display Result
+kable(akt.validate.result,format="html", caption="Akt Validation Result")
+
+kable(akt.validate.sd.result,format="html", caption="Akt Validation Standard Deviation Result")
+```
+
+## Run Validation for mTOR
+
+```{r valid_mtor, fig.align="center", echo=TRUE, eval=FALSE}
+
+# Phosphoproteomic Data
+mtor.phospho.result <- ValidateEnsemble(vt.full.data = full.mtor.phospho.data, vt.stack.size = 50, vt.positive.substrate = mtor, vt.negative.substrate = akt, vt.negative.size = mtor.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Motif Data
+mtor.motif.result <- ValidateEnsemble(vt.full.data = full.mtor.motif.data, vt.stack.size = 50, vt.positive.substrate = mtor, vt.negative.substrate = akt, vt.negative.size = mtor.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Pairwise BLOSUM62 similarity data
+mtor.parseq.result <- ValidateEnsemble(vt.full.data = full.mtor.parseq.data, vt.stack.size = 50, vt.positive.substrate = mtor, vt.negative.substrate = akt, vt.negative.size = mtor.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Phosphoproteomic and Pairwise BLOSUM62 similarity Data
+mtor.phospho.parseq.result <- ValidateEnsemble(vt.full.data = full.mtor.phospho.parseq.data, vt.stack.size = 50, vt.positive.substrate = mtor, vt.negative.substrate = akt, vt.negative.size = mtor.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Phosphoproteomic and Motif Data
+mtor.phospho.motif.result <- ValidateEnsemble(vt.full.data = full.mtor.phospho.motif.data, vt.stack.size = 50, vt.positive.substrate = mtor, vt.negative.substrate = akt, vt.negative.size = mtor.length, vt.fold.n = 3, vt.negative.substrate.flag = 1, vt.validation.flag = 1, vt.validation.substrate = NULL, vt.seed.flag = FALSE, FUN = svmEnsemble, vt.n = 10)
+
+# Plot Precision Recall Curves
+mtor.phospho.p <- c()
+mtor.phospho.n <- c()
+mtor.motif.p <- c()
+mtor.motif.n <- c()
+mtor.parseq.p <- c()
+mtor.parseq.n <- c()
+mtor.phospho.motif.p <- c()
+mtor.phospho.motif.n <- c()
+mtor.phospho.parseq.p <- c()
+mtor.phospho.parseq.n <- c()
+n <- length(mtor.phospho.result$p.predict)
+
+for(j in 1:n){
+    
+    mtor.phospho.p <- c(mtor.phospho.p, mtor.phospho.result$p.predict[[j]])
+    mtor.phospho.n <- c(mtor.phospho.n, mtor.phospho.result$n.predict[[j]])
+    mtor.motif.p <- c(mtor.motif.p, mtor.motif.result$p.predict[[j]])
+    mtor.motif.n <- c(mtor.motif.n, mtor.motif.result$n.predict[[j]])
+    mtor.parseq.p <- c(mtor.parseq.p, mtor.parseq.result$p.predict[[j]])
+    mtor.parseq.n <- c(mtor.parseq.n, mtor.parseq.result$n.predict[[j]])
+    mtor.phospho.motif.p <- c(mtor.phospho.motif.p, mtor.phospho.motif.result$p.predict[[j]])
+    mtor.phospho.motif.n <- c(mtor.phospho.motif.n, mtor.phospho.motif.result$n.predict[[j]])
+    mtor.phospho.parseq.p <- c(mtor.phospho.parseq.p, mtor.phospho.parseq.result$p.predict[[j]])
+    mtor.phospho.parseq.n <- c(mtor.phospho.parseq.n, mtor.phospho.parseq.result$n.predict[[j]])
+
+    
+}
+
+```
+
+
+## Plot PRC for mTOR
+
+```{r plot_curve_mtor, fig.align="center", echo=TRUE}
+
+plot(precision ~ recall, t(coords(mtor.phospho.motif.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="dodgerblue", xlab="Recall", ylab="Precision", main="mTOR - Motif")
+lines(precision ~ recall, t(coords(mtor.motif.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="forestgreen", lty="dotted")
+lines(precision ~ recall, t(coords(mtor.phospho.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="red", lty="dotted")
+legend("bottomleft", legend=c("Phospho & Motif", "Motif", "Phospho"), col=c("dodgerblue", "forestgreen", "red"), lty=c("solid","dotted","twodash"), cex=1, bty="n", lwd=3)
+
+plot(precision ~ recall, t(coords(mtor.phospho.parseq.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="dodgerblue", xlab="Recall", ylab="Precision", main="mTOR - BLOSUM62 Similarity")
+lines(precision ~ recall, t(coords(mtor.parseq.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="forestgreen", lty="dotted")
+lines(precision ~ recall, t(coords(mtor.phospho.curve, "all", ret = c("recall", "precision"))), type="l", lwd=3, col="red", lty="dotted")
+legend("bottomleft", legend=c("Phospho & BLOSUM62 Similarity", "BLOSUM62 Similarity", "Phospho"), col=c("dodgerblue", "forestgreen", "red"), lty=c("solid","dotted","twodash"), cex=1, bty="n", lwd=3)
+
+```
+
+## Summarise mTOR Validation Result
+
+```{r summ_mtor, fig.align="center", echo=TRUE}
+
+mtor.validate.result <- rbind(cbind(mean(mtor.phospho.motif.result$sen), mean(mtor.phospho.motif.result$spe), mean(mtor.phospho.motif.result$f1), mean(mtor.phospho.motif.result$gm), mean(mtor.phospho.motif.result$mcc)),cbind(mean(mtor.phospho.parseq.result$sen), mean(mtor.phospho.parseq.result$spe), mean(mtor.phospho.parseq.result$f1), mean(mtor.phospho.parseq.result$gm), mean(mtor.phospho.parseq.result$mcc)),cbind(mean(mtor.phospho.result$sen), mean(mtor.phospho.result$spe), mean(mtor.phospho.result$f1), mean(mtor.phospho.result$gm), mean(mtor.phospho.result$mcc)),cbind(mean(mtor.motif.result$sen), mean(mtor.motif.result$spe), mean(mtor.motif.result$f1), mean(mtor.motif.result$gm), mean(mtor.motif.result$mcc)),cbind(mean(mtor.parseq.result$sen), mean(mtor.parseq.result$spe), mean(mtor.parseq.result$f1), mean(mtor.parseq.result$gm), mean(mtor.parseq.result$mcc)))
+colnames(mtor.validate.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(mtor.validate.result) <- c("Phospho & Motif", "Phospho & BLOSUM62 Similarity", "Phospho", "Motif", "BLOSUM62 Similarity")
+
+# Standard Deviation
+mtor.validate.sd.result <- rbind(cbind(sd(mtor.phospho.motif.result$sen), sd(mtor.phospho.motif.result$spe), sd(mtor.phospho.motif.result$f1), sd(mtor.phospho.motif.result$gm), sd(mtor.phospho.motif.result$mcc)),cbind(sd(mtor.phospho.parseq.result$sen), sd(mtor.phospho.parseq.result$spe), sd(mtor.phospho.parseq.result$f1), sd(mtor.phospho.parseq.result$gm), sd(mtor.phospho.parseq.result$mcc)),cbind(sd(mtor.phospho.result$sen), sd(mtor.phospho.result$spe), sd(mtor.phospho.result$f1), sd(mtor.phospho.result$gm), sd(mtor.phospho.result$mcc)),cbind(sd(mtor.motif.result$sen), sd(mtor.motif.result$spe), sd(mtor.motif.result$f1), sd(mtor.motif.result$gm), sd(mtor.motif.result$mcc)),cbind(sd(mtor.parseq.result$sen), sd(mtor.parseq.result$spe), sd(mtor.parseq.result$f1), sd(mtor.parseq.result$gm), sd(mtor.parseq.result$mcc)))
+colnames(mtor.validate.sd.result) <- c("Sensitivity","Specificity", "f1-score", "Geometric Mean","MCC")
+rownames(mtor.validate.sd.result) <- c("Phospho & Motif", "Phospho & BLOSUM62 Similarity", "Phospho", "Motif", "BLOSUM62 Similarity")
+
+# Display Result
+kable(mtor.validate.result,format="html", caption="Akt Validation Result")
+
+kable(mtor.validate.sd.result,format="html", caption="Akt Validation Standard Deviation Result")
+
+```
+
+### Scatterplot 3D for Akt
+
+/*
+ - Visualise the various model compositions
+ - 
+*/
+
+```{r akt_3d, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE}
+
+# PRC for phosphoproteomic data
+full.akt.phospho.data.svm.result <- svmEnsemble(full.data = full.akt.phospho.data, stack.size = 50, positive.substrate = akt, negative.substrate = mtor, negative.size = akt.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = akt.validation.substrate, seed.flag = TRUE)
+
+akt.phospho.data.svm.probs <- full.akt.phospho.data.svm.result$correctedpredict
+
+akt.p.phospho.svm <- subset(akt.phospho.data.svm.probs, rownames(akt.phospho.data.svm.probs) %in% rownames(akt))[,1]
+akt.n.phospho.svm <- subset(akt.phospho.data.svm.probs, !rownames(akt.phospho.data.svm.probs) %in% rownames(akt))[,1]
+
+# PRC for motif data
+full.akt.motif.data.svm.result <- svmEnsemble(full.data = full.akt.motif.data, stack.size = 50, positive.substrate = akt, negative.substrate = mtor, negative.size = akt.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = akt.validation.substrate, seed.flag = TRUE)
+
+akt.motif.data.svm.probs <- full.akt.motif.data.svm.result$correctedpredict
+
+akt.p.motif.svm <- subset(akt.motif.data.svm.probs, rownames(akt.motif.data.svm.probs) %in% rownames(akt))[,1]
+akt.n.motif.svm <- subset(akt.motif.data.svm.probs, !rownames(akt.motif.data.svm.probs) %in% rownames(akt))[,1]
+
+# PRC for phosphoproteomic and motif data
+full.akt.phospho.motif.data.svm.result <- svmEnsemble(full.data = full.akt.phospho.motif.data, stack.size = 50, positive.substrate = akt, negative.substrate = mtor, negative.size = akt.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = akt.validation.substrate, seed.flag = TRUE)
+
+akt.phospho.motif.data.svm.probs <- full.akt.phospho.motif.data.svm.result$correctedpredict
+
+akt.p.phospho.motif.svm <- subset(akt.phospho.motif.data.svm.probs, rownames(akt.phospho.motif.data.svm.probs) %in% rownames(akt))[,1]
+akt.n.phospho.motif.svm <- subset(akt.phospho.motif.data.svm.probs, !rownames(akt.phospho.motif.data.svm.probs) %in% rownames(akt))[,1]
+
+# Summarise result
+akt.summary <- cbind(akt.phospho.motif.data.svm.probs, akt.phospho.data.svm.probs, akt.motif.data.svm.probs)
+colnames(akt.summary) <- c("Phospho & Motif", "Phospho", "Motif")
+
+# View(akt.summary[order(akt.summary$`Phospho & Motif`, decreasing = TRUE),])
+
+# Export Data
+write.csv(akt.summary[order(akt.summary$`Phospho & Motif`, decreasing = TRUE),], file = "akt_2017.csv",row.names=TRUE)
+
+# Generate 3D plot
+scatter3D(x = akt.motif.data.svm.probs[,1], y = akt.phospho.data.svm.probs[,1], z= akt.phospho.motif.data.svm.probs[,1], pch = 20, cex = 2, ticktype = "detailed", phi = 30, theta = 50, colvar=akt.phospho.motif.data.svm.probs[,1], xlab="Motif Score", ylab="Phospho Score", zlab="Full Prediction Score", main="Akt")
+
+scatter3D(x = akt.p.motif.svm, y = akt.p.phospho.svm, z= akt.p.phospho.motif.svm, add = TRUE, colkey = FALSE, col = "black", pch = 19, cex = 3)
+
+```
+
+### Scatterplot 3D for mTOR
+
+```{r mtor_3d, fig.align="center", echo=TRUE, warning=FALSE, message=FALSE}
+
+# PRC for phosphoproteomic data
+full.mtor.phospho.data.svm.result <- svmEnsemble(full.data = full.mtor.phospho.data, stack.size = 50, positive.substrate = mtor, negative.substrate = akt, negative.size = mtor.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = mtor.validation.substrate, seed.flag = TRUE)
+
+mtor.phospho.data.svm.probs <- full.mtor.phospho.data.svm.result$correctedpredict
+
+mtor.p.phospho.svm <- subset(mtor.phospho.data.svm.probs, rownames(mtor.phospho.data.svm.probs) %in% rownames(mtor))[,1]
+mtor.n.phospho.svm <- subset(mtor.phospho.data.svm.probs, !rownames(mtor.phospho.data.svm.probs) %in% rownames(mtor))[,1]
+
+# PRC for motif data
+full.mtor.motif.data.svm.result <- svmEnsemble(full.data = full.mtor.motif.data, stack.size = 50, positive.substrate = mtor, negative.substrate = akt, negative.size = mtor.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = mtor.validation.substrate, seed.flag = TRUE)
+
+mtor.motif.data.svm.probs <- full.mtor.motif.data.svm.result$correctedpredict
+
+mtor.p.motif.svm <- subset(mtor.motif.data.svm.probs, rownames(mtor.motif.data.svm.probs) %in% rownames(mtor))[,1]
+mtor.n.motif.svm <- subset(mtor.motif.data.svm.probs, !rownames(mtor.motif.data.svm.probs) %in% rownames(mtor))[,1]
+
+# PRC for phosphoproteomic and motif data
+full.mtor.phospho.motif.data.svm.result <- svmEnsemble(full.data = full.mtor.phospho.motif.data, stack.size = 50, positive.substrate = mtor, negative.substrate = akt, negative.size = mtor.length, fold.n = 3, negative.substrate.flag = 1, validation.flag = 0, validation.substrate = mtor.validation.substrate, seed.flag = TRUE)
+
+mtor.phospho.motif.data.svm.probs <- full.mtor.phospho.motif.data.svm.result$correctedpredict
+
+mtor.p.phospho.motif.svm <- subset(mtor.phospho.motif.data.svm.probs, rownames(mtor.phospho.motif.data.svm.probs) %in% rownames(mtor))[,1]
+mtor.n.phospho.motif.svm <- subset(mtor.phospho.motif.data.svm.probs, !rownames(mtor.phospho.motif.data.svm.probs) %in% rownames(mtor))[,1]
+
+# Summarise result
+mtor.summary <- cbind(mtor.phospho.motif.data.svm.probs, mtor.phospho.data.svm.probs, mtor.motif.data.svm.probs)
+colnames(mtor.summary) <- c("Phospho & Motif", "Phospho", "Motif")
+
+# View(mtor.summary[order(mtor.summary$`Phospho & Motif`, decreasing = TRUE),])
+
+# Export Data
+write.csv(mtor.summary[order(mtor.summary$`Phospho & Motif`, decreasing = TRUE),], file = "mtor_2017.csv",row.names=TRUE)
+
+# Generate 3D plot
+scatter3D(x = mtor.motif.data.svm.probs[,1], y = mtor.phospho.data.svm.probs[,1], z= mtor.phospho.motif.data.svm.probs[,1], pch = 20, cex = 2, ticktype = "detailed", phi = 30, theta = 50, colvar=mtor.phospho.motif.data.svm.probs[,1], xlab="Motif Score", ylab="Phospho Score", zlab="Full Prediction Score", main="mTOR")
+
+scatter3D(x = mtor.p.motif.svm, y = mtor.p.phospho.svm, z= mtor.p.phospho.motif.svm, add = TRUE, colkey = FALSE, col = "black", pch = 19, cex = 3)
+
+```
+
+```{r call_postgres_akt, warning=FALSE, message=FALSE, echo=FALSE}
+pg = dbDriver("PostgreSQL")
+
+pool <- dbConnect(
+  pg,
+  dbname = "STAT5003_G13",
+  host = "stat5003g13.cbe5hq61ynmb.ap-southeast-2.rds.amazonaws.com",
+  user = "STAT5003_G13",
+  password = "STAT5003_G13"
+)
+```
+
+# 5. Compare Previous Result
+## Correlation and Residual Plot for Akt
+
+/*
+  - Using correlation with previous years results
+  - 98% correlation score
+  - Because the input data is 'unpair', use Wilcoxon et al. 
+*/
+
+```{r comparison_akt_2017, fig.align="center", echo=TRUE}
+
+# Select all data from POSTGRES DB
+akt.compare <- dbGetQuery(pool,"SELECT
+ A.*
+,A.full_model_predict - B.full_model_predict AS delta_akt_mtor
+,C.full_model_predict AS full_model_predict_2016
+,C.uniprot_id AS uniprot_id_2016
+,A.full_model_predict - C.full_model_predict  AS delta_2017_2016
+FROM cleansed_predict_akt_2017 A
+INNER JOIN cleansed_predict_mtor_2017 B
+ ON A.identifier=B.identifier
+ LEFT JOIN cleansed_predict_akt_2016 C
+ ON UPPER(CAST(C.genesymbol || ';' || CAST(C.phosphorylation_site AS VARCHAR(10)) || ';' AS VARCHAR(100))) = A.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_akt_substrates)
+AND C.genesymbol IS NOT NULL;")
+
+# Correlation
+print(cor(subset(akt.compare, select=c("full_model_predict","full_model_predict_2016"))))
+
+# Residual Standard Deviation
+print(paste("Standard Deviation: ",sd(akt.compare$delta_2017_2016)))
+
+# Wilcoxon-Mann-Whitney rank sum test 
+print(wilcox.test(akt.compare$full_model_predict,akt.compare$full_model_predict_2016, correct=FALSE, paired = FALSE))
+
+# Compare number of positives between 2016 and 2017
+akt.confusionmatrix <- dbGetQuery(pool,"SELECT
+ SUM(CASE WHEN C.full_model_predict > 0.5 AND A.full_model_predict > 0.5 THEN 1 ELSE 0 END) AS TP
+,SUM(CASE WHEN C.full_model_predict > 0.5 AND A.full_model_predict <= 0.5 THEN 1 ELSE 0 END) AS FN
+,SUM(CASE WHEN C.full_model_predict <= 0.5 AND A.full_model_predict <= 0.5 THEN 1 ELSE 0 END) AS TN
+,SUM(CASE WHEN C.full_model_predict <= 0.5 AND A.full_model_predict > 0.5 THEN 1 ELSE 0 END) AS FP
+FROM cleansed_predict_akt_2017 A
+INNER JOIN cleansed_predict_mtor_2017 B
+ ON A.identifier=B.identifier
+ LEFT JOIN cleansed_predict_akt_2016 C
+ ON UPPER(CAST(C.genesymbol || ';' || CAST(C.phosphorylation_site AS VARCHAR(10)) || ';' AS VARCHAR(100))) = A.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_akt_substrates)
+AND C.genesymbol IS NOT NULL;")
+
+print("Compare number of positives between 2016 and 2017")
+print(akt.confusionmatrix)
+TP <- akt.confusionmatrix$tp
+FP <- akt.confusionmatrix$fp
+TN <- akt.confusionmatrix$tn
+FN <- akt.confusionmatrix$fn
+
+sen <- TP/(TP + FN)
+spe <- TN/(TN + FP)
+f1 <- 2*TP/(2*TP + FP + FN)
+gm <- sqrt((TP/(TP + FN)) * (TP/(TP + FP)))
+mcc <- ((TP * TN)-(FP * FN))/sqrt((TP + FP)*(TP + FN)*(TN + FP)*(TN + FN))
+print(cbind(sen,spe,f1,gm,mcc))
+
+# Plot Residual Plot
+plot(akt.compare$full_model_predict, akt.compare$delta_2017_2016, ylim=c(-1,1), col="dodgerblue1", xlab="Actual 2017 Prediction", ylab="Residual Value (2017 vs 2016 prediction)", main="Akt Residual Plot")
+abline(h=0, col="black")
+
+```
+
+```{r call_postgres_mtor, warning=FALSE, message=FALSE, echo=FALSE}
+pg = dbDriver("PostgreSQL")
+
+pool <- dbConnect(
+  pg,
+  dbname = "STAT5003_G13",
+  host = "stat5003g13.cbe5hq61ynmb.ap-southeast-2.rds.amazonaws.com",
+  user = "STAT5003_G13",
+  password = "STAT5003_G13"
+)
+```
+
+## Correlation and Residual Plot for mTOR
+
+```{r comparison_mtor_2017, fig.align="center", echo=TRUE}
+
+# Select all data from POSTGRES DB
+mtor.compare <- dbGetQuery(pool,"SELECT
+ A.*
+,A.full_model_predict - B.full_model_predict AS delta_mtor_akt
+,C.full_model_predict AS full_model_predict_2016
+,C.uniprot_id AS uniprot_id_2016
+,A.full_model_predict - C.full_model_predict  AS delta_2017_2016
+FROM cleansed_predict_mtor_2017 A
+INNER JOIN cleansed_predict_mtor_2017 B
+ ON A.identifier=B.identifier
+ LEFT JOIN cleansed_predict_mtor_2016 C
+ ON UPPER(CAST(C.genesymbol || ';' || CAST(C.phosphorylation_site AS VARCHAR(10)) || ';' AS VARCHAR(100))) = A.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_mtor_substrates)
+AND C.genesymbol IS NOT NULL;")
+
+# Correlation
+print(cor(subset(mtor.compare, select=c("full_model_predict","full_model_predict_2016"))))
+
+# Residual Standard Deviation
+print(paste("Standard Deviation: ",sd(mtor.compare$delta_2017_2016)))
+
+# Wilcoxon-Mann-Whitney rank sum test 
+print(wilcox.test(mtor.compare$full_model_predict,mtor.compare$full_model_predict_2016, correct=FALSE, paired = FALSE))
+
+# Compare number of positives between 2016 and 2017
+mtor.confusionmatrix <- dbGetQuery(pool,"SELECT
+ SUM(CASE WHEN C.full_model_predict > 0.5 AND A.full_model_predict > 0.5 THEN 1 ELSE 0 END) AS TP
+,SUM(CASE WHEN C.full_model_predict > 0.5 AND A.full_model_predict <= 0.5 THEN 1 ELSE 0 END) AS FN
+,SUM(CASE WHEN C.full_model_predict <= 0.5 AND A.full_model_predict <= 0.5 THEN 1 ELSE 0 END) AS TN
+,SUM(CASE WHEN C.full_model_predict <= 0.5 AND A.full_model_predict > 0.5 THEN 1 ELSE 0 END) AS FP
+FROM cleansed_predict_mtor_2017 A
+INNER JOIN cleansed_predict_mtor_2017 B
+ ON A.identifier=B.identifier
+ LEFT JOIN cleansed_predict_mtor_2016 C
+ ON UPPER(CAST(C.genesymbol || ';' || CAST(C.phosphorylation_site AS VARCHAR(10)) || ';' AS VARCHAR(100))) = A.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_mtor_substrates)
+AND C.genesymbol IS NOT NULL;")
+
+print("Compare number of positives between 2016 and 2017")
+print(mtor.confusionmatrix)
+TP <- mtor.confusionmatrix$tp
+FP <- mtor.confusionmatrix$fp
+TN <- mtor.confusionmatrix$tn
+FN <- mtor.confusionmatrix$fn
+
+sen <- TP/(TP + FN)
+spe <- TN/(TN + FP)
+f1 <- 2*TP/(2*TP + FP + FN)
+gm <- sqrt((TP/(TP + FN)) * (TP/(TP + FP)))
+mcc <- ((TP * TN)-(FP * FN))/sqrt((TP + FP)*(TP + FN)*(TN + FP)*(TN + FN))
+print(cbind(sen,spe,f1,gm,mcc))
+
+# Plot Residual Plot
+plot(mtor.compare$full_model_predict, mtor.compare$delta_2017_2016, ylim=c(-1,1), col="lightsalmon1", xlab="Actual 2017 Prediction", ylab="Residual Value (2017 vs 2016 prediction)", main="mTOR Residual Plot")
+abline(h=0, col="black")
+
+```
+
+## Generate Output Files
+
+```{r gen_out, fig.align="center", echo=TRUE}
+
+# Select Akt data from POSTGRES DB
+akt.final.result <- dbGetQuery(pool,"SELECT
+ A.*
+,A.full_model_predict - B.full_model_predict AS delta_akt_mtor
+FROM cleansed_predict_akt_2017 A
+INNER JOIN cleansed_predict_mtor_2017 B
+ ON A.identifier=B.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_akt_substrates)
+ORDER BY full_model_predict DESC;")
+
+write.csv(akt.final.result, file = "predict_akt_2017.csv",row.names=TRUE)
+write.csv(akt.final.result[akt.final.result$full_model_predict>0.5,], file = "list_akt_2017.csv",row.names=TRUE)
+
+# Select mTOR data from POSTGRES DB
+mtor.final.result <- dbGetQuery(pool,"SELECT
+ A.*
+,A.full_model_predict - B.full_model_predict AS delta_mtor_akt
+FROM cleansed_predict_mtor_2017 A
+INNER JOIN cleansed_predict_akt_2017 B
+ ON A.identifier=B.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_mtor_substrates)
+ORDER BY full_model_predict DESC;")
+
+write.csv(mtor.final.result, file = "predict_mtor_2017.csv",row.names=TRUE)
+write.csv(mtor.final.result[mtor.final.result$full_model_predict>0.5,], file = "list_mtor_2017.csv",row.names=TRUE)
+
+```
+## Generate Summary Tables
+                                         
+
+```{r gen_summ, fig.align="center", echo=TRUE}
+
+# Select Akt data from POSTGRES DB
+akt.top20.result <- dbGetQuery(pool,"SELECT
+ A.*
+,A.full_model_predict - B.full_model_predict AS delta_akt_mtor
+FROM cleansed_predict_akt_2017 A
+INNER JOIN cleansed_predict_mtor_2017 B
+ ON A.identifier=B.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_akt_substrates)
+ORDER BY full_model_predict DESC
+LIMIT 20;")
+
+kable(akt.top20.result, format = "html")
+                                              
+
+# Select mTOR data from POSTGRES DB
+mtor.top20.result <- dbGetQuery(pool,"SELECT
+ A.*
+,A.full_model_predict - B.full_model_predict AS delta_mtor_akt
+FROM cleansed_predict_mtor_2017 A
+INNER JOIN cleansed_predict_akt_2017 B
+ ON A.identifier=B.identifier
+WHERE A.identifier NOT IN (SELECT identifier FROM stg_mtor_substrates)
+ORDER BY full_model_predict DESC
+LIMIT 20;")
+
+kable(mtor.top20.result, format = "html")
+                   
+                      
+                   
+                                   
+                              
+
+```
+
+# 6. Supplementary Evaluation
+## Load Libraries and Data for clustering
+
+Unsupervised learning methodology to study the substrates using phoso protein data as well as sequence which is encoded in PSSM score.
+
+```{r clusters, fig.align="center", warning=FALSE ,echo=TRUE, eval=TRUE}
+#load libraries and data
+library(dbscan)
+library(clues)
+library(clValid)
+library(e1071)
+library(ClueR)
+library(DBI)
+
+akt.motif.score <- data.frame(akt.seq.pssm.score[,dim(akt.seq.pssm.score)[2]])
+colnames(akt.motif.score) <- 'akt.motif.score'
+
+akt.data <- cbind(all.data[,-1], akt.motif.score)
+full.data <- akt.data[, c(3:10)]
+
+valdata1 <-  rbind(mtor)
+valdata1$class <- 2
+valdata2 <- rbind(akt)
+valdata2$class <- 1
+valdata <- rbind(valdata1,valdata2)
+rownames1 <- rownames(valdata)
+
+```
+
+## Clustering method 1
+## Partition based clustering approach
+
+### Perform search on optimal clusters numbers
+Search based on internal cluster validation scores revealed time course features give better clustering output.
+To determine the correct cluster numbers we perform a search on time course data.
+
+```{r, fig.align="center", warning=FALSE ,echo=TRUE, eval=FALSE}
+
+full.data <- akt.data[, c(3:10)]
+intern <- clValid(as.matrix(full.data), nClust=(2:10),maxitems = 12063, validation="internal", clMethods=c("kmeans"))
+optimalScores(intern)
+summary(intern)
+par(mfrow=c(2,2))
+plot(intern)
+```
+
+## Chosen cluster number is 2.
+## Get membership scores for 2 clusters as they have best internal cluster validation score.
+
+### Partiton clusters based on time window
+Fuzzy CMeans provide membership scores for each substrate belonging to a particular cluster. We validate the clustering labels against the prediction labels to calculate the ARI. To estimate the purity in  clusters.
+
+```{r, fig.align="center", warning=FALSE ,echo=TRUE, eval=TRUE}
+
+SVMPredictakt <- read.csv(file="akt_2017.csv", header=TRUE, sep=",")
+
+SVMPredictmtor <- read.csv(file="mtor_2017.csv", header=TRUE, sep=",")
+
+full.data <- akt.data[, c(3:10)]
+
+#windows.options(width=10, height=5)
+
+res <- cmeans(full.data, 2)
+fuzzPlot(as.matrix(full.data), res, mfrow = c(1, 2))
+
+full.data$clusterclass <- res$cluster
+needed.data <- subset(full.data, rownames(full.data) %in% rownames(valdata))
+
+
+
+SVMPredictakt <- SVMPredictakt[match(rownames(full.data), SVMPredictakt$X),]
+SVMPredictmtor <- SVMPredictmtor[match(rownames(full.data), SVMPredictmtor$X),]
+
+SVMPredictakt$class <- ifelse((SVMPredictakt[,2] > 0.5), 1, 0)
+SVMPredictmtor$class <- ifelse((SVMPredictmtor[,2] > 0.5), 1, 0)
+
+needed.data <- subset(full.data, rownames(full.data) %in% rownames1)
+
+clusterval <- adjustedRand(needed.data$clusterclass, valdata$class)
+
+clusterval
+
+print("Comparing cluster labels against SVM AKT ensemble model predictions.")
+clusterval
+
+write.csv( cbind(row.names(full.data),res$cluster,res$membership), file="clustert_mtor.csv");
+
+
+clusterval <- adjustedRand(full.data$clusterclass, SVMPredictmtor$class)
+
+print("Comparing cluster labels against SVM MTOR ensemble model predictions.")
+clusterval
+
+write.csv( cbind(row.names(full.data),res$cluster,res$membership), file="clustert_akt.csv");
+
+```
+
+The cmeans clustering and SVM ensemble classifier have 76.6% similarity in their class prediction with AKT predictions and 86.5% similarity with MTOR predictions. 
+
+
+## Clustering method 2
+## Density Based clustering
+### Comparing AKT svm ensemble model prediction against dbscan clusters on AKT motif score
+
+Density based clustering using AUC, Avg and AKT motif scores.
+
+```{r, fig.align="center", warning=FALSE ,echo=TRUE, eval=TRUE}
+full.data <- akt.data[, c(1,2,15)]
+
+eps_vals<- c()
+RandIndex_score  <- c()
+
+for (i  in 1:9 )
+{
+  ep  = i/10;
+  eps_vals <- c(eps_vals,ep)
+  res <- dbscan(full.data,eps = ep, minPts = 5);
+
+  full.data$clusterclass <- res$cluster
+  needed.data <- subset(full.data, rownames(full.data) %in% rownames1)
+
+  clusterval <- adjustedRand(needed.data$clusterclass, valdata$class)
+  RandIndex_score <- c(RandIndex_score,clusterval["Rand"])
+}
+
+
+plot(eps_vals, RandIndex_score, main="EPs value Vs AKT ARI Score")
+
+write.csv( cbind(row.names(full.data),res$cluster), 
+           file ="clustert_akt_dbscan.csv");
+
+print("Eps with 0.2 has the best rand index value with labeled AKT data, verifying SVM predictions with eps 0.2")
+res <- dbscan(full.data,eps = 0.2, minPts = 5);
+full.data$clusterclass <- res$cluster
+clusterval <- adjustedRand(full.data$clusterclass, SVMPredictakt$class)
+clusterval
+
+```
+
+Dbscan clustering SVM akt predictions have 84.6% similar predictions
+
+
+#Comparing MTOR svm ensemble model prediction against dbscan clusters on AKT motif score
+
+Density based clustering using AUC, Avg and MTOR motif scores.
+
+```{r , fig.align="center", warning=FALSE ,echo=TRUE, eval=TRUE}
+
+mtor.motif.score <- data.frame(mtor.seq.pssm.score[,dim(mtor.seq.pssm.score)[2]])
+colnames(mtor.motif.score) <- 'mtor.motif.score'
+
+mtor.data <- cbind(all.data[,-1], mtor.motif.score)
+#akt.data <- all.data[,-1]
+full.data <- mtor.data[,  c(1,2,15)]
+
+eps_vals<- c()
+RandIndex_score  <- c()
+
+for (i  in 1:9 )
+{
+  ep  = i/10;
+  eps_vals <- c(eps_vals,ep)
+  res <- dbscan(full.data,eps = ep, minPts = 5);
+
+  full.data$clusterclass <- res$cluster
+  needed.data <- subset(full.data, rownames(full.data) %in% rownames1)
+
+  clusterval <- adjustedRand(needed.data$clusterclass, valdata$class)
+  RandIndex_score <- c(RandIndex_score,clusterval["Rand"])
+}
+
+plot(eps_vals, RandIndex_score, main="EPs value Vs AKT ARI Score")
+
+write.csv( cbind(row.names(full.data),res$cluster), 
+           file ="clustert_akt_dbscan.csv");
+
+print("Eps with 0.1 has the best rand index value with labeled MTOR data, verifying SVM predictions with eps 0.1")
+res <- dbscan(full.data,eps = 0.1, minPts = 5);
+full.data$clusterclass <- res$cluster
+clusterval <- adjustedRand(full.data$clusterclass, SVMPredictmtor$class)
+clusterval
+
+```
+
+Dbscan clustering and SVM mtor predictions have 74.2% similar predictions.
+
+## References
+
+### (Yang et al., 2015)
+
+Yang, P., Humphrey, S., James, D., Yang, Y. and Jothi, R. (2015). Positive-unlabeled ensemble learning for kinase substrate prediction from dynamic phosphoproteomics data. Bioinformatics, p.btv550.
+
+
+
